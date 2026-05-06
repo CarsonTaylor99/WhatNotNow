@@ -1,0 +1,591 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Whatnot Giveaway Scanner</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=Syne:wght@400;600;800&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg:        #0a0a0f;
+    --surface:   #111118;
+    --border:    #1e1e2e;
+    --accent:    #00ff88;
+    --accent2:   #ff6b35;
+    --text:      #e8e8f0;
+    --muted:     #555570;
+    --card-bg:   #13131c;
+    --scan-col:  #1a1a28;
+    --glow:      0 0 20px rgba(0,255,136,0.15);
+  }
+
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: 'Syne', sans-serif;
+    min-height: 100vh;
+    display: grid;
+    grid-template-rows: auto 1fr;
+    overflow-x: hidden;
+  }
+
+  /* ── noise overlay ── */
+  body::before {
+    content: '';
+    position: fixed; inset: 0;
+    background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='0.03'/%3E%3C/svg%3E");
+    pointer-events: none; z-index: 0;
+  }
+
+  /* ── header ── */
+  header {
+    position: relative; z-index: 10;
+    padding: 24px 32px 20px;
+    border-bottom: 1px solid var(--border);
+    display: flex; align-items: center; gap: 24px;
+    background: var(--surface);
+  }
+
+  .logo {
+    font-size: 1.1rem; font-weight: 800;
+    letter-spacing: -0.02em; color: var(--accent);
+    text-transform: uppercase;
+  }
+  .logo span { color: var(--text); opacity: 0.4; }
+
+  .status-bar {
+    flex: 1;
+    display: flex; align-items: center; gap: 12px;
+  }
+
+  #status-dot {
+    width: 8px; height: 8px; border-radius: 50%;
+    background: var(--muted);
+    transition: background 0.3s, box-shadow 0.3s;
+    flex-shrink: 0;
+  }
+  #status-dot.scanning {
+    background: var(--accent);
+    box-shadow: 0 0 8px var(--accent);
+    animation: pulse 1.5s ease-in-out infinite;
+  }
+
+  @keyframes pulse {
+    0%, 100% { opacity: 1; }
+    50%       { opacity: 0.4; }
+  }
+
+  #status-text {
+    font-family: 'Space Mono', monospace;
+    font-size: 0.72rem; color: var(--muted);
+    max-width: 480px; overflow: hidden;
+    text-overflow: ellipsis; white-space: nowrap;
+  }
+
+  .controls { display: flex; gap: 10px; align-items: center; }
+
+  button {
+    font-family: 'Syne', sans-serif;
+    font-size: 0.8rem; font-weight: 600;
+    padding: 8px 20px; border-radius: 6px;
+    border: 1px solid transparent; cursor: pointer;
+    transition: all 0.15s;
+    letter-spacing: 0.04em; text-transform: uppercase;
+  }
+
+  #btn-start {
+    background: var(--accent); color: #000;
+    border-color: var(--accent);
+  }
+  #btn-start:hover { box-shadow: var(--glow); filter: brightness(1.1); }
+  #btn-start:disabled { opacity: 0.4; cursor: default; }
+
+  #btn-stop {
+    background: transparent; color: var(--accent2);
+    border-color: var(--accent2);
+  }
+  #btn-stop:hover { background: rgba(255,107,53,0.08); }
+  #btn-stop:disabled { opacity: 0.3; cursor: default; }
+
+  /* ── main layout ── */
+  main {
+    position: relative; z-index: 1;
+    display: grid;
+    grid-template-columns: 260px 1fr;
+    height: calc(100vh - 73px);
+  }
+
+  /* ── sidebar ── */
+  aside {
+    border-right: 1px solid var(--border);
+    background: var(--surface);
+    padding: 24px 20px;
+    display: flex; flex-direction: column; gap: 24px;
+    overflow-y: auto;
+  }
+
+  .section-label {
+    font-size: 0.65rem; font-weight: 700;
+    letter-spacing: 0.12em; text-transform: uppercase;
+    color: var(--muted); margin-bottom: 10px;
+  }
+
+  /* category toggles */
+  .cat-list { display: flex; flex-direction: column; gap: 6px; }
+
+  .cat-toggle {
+    display: flex; align-items: center; gap: 10px;
+    padding: 8px 12px; border-radius: 6px;
+    background: var(--scan-col); border: 1px solid var(--border);
+    cursor: pointer; transition: border-color 0.15s;
+  }
+  .cat-toggle.active { border-color: var(--accent); }
+  .cat-toggle:hover  { border-color: var(--accent); }
+
+  .cat-check {
+    width: 14px; height: 14px; border-radius: 3px;
+    border: 1.5px solid var(--muted);
+    display: flex; align-items: center; justify-content: center;
+    flex-shrink: 0; transition: all 0.15s;
+  }
+  .cat-toggle.active .cat-check {
+    background: var(--accent); border-color: var(--accent);
+  }
+  .cat-check svg { display: none; }
+  .cat-toggle.active .cat-check svg { display: block; }
+  .cat-name { font-size: 0.82rem; font-weight: 600; }
+
+  /* stats */
+  .stats { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+
+  .stat-box {
+    background: var(--scan-col); border: 1px solid var(--border);
+    border-radius: 6px; padding: 12px;
+    display: flex; flex-direction: column; gap: 4px;
+  }
+  .stat-val {
+    font-family: 'Space Mono', monospace;
+    font-size: 1.4rem; font-weight: 700; color: var(--accent);
+  }
+  .stat-lbl { font-size: 0.65rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.08em; }
+
+  /* now scanning */
+  #now-scanning {
+    background: var(--scan-col); border: 1px solid var(--border);
+    border-radius: 8px; padding: 14px;
+    display: none; flex-direction: column; gap: 6px;
+  }
+  #now-scanning.visible { display: flex; }
+
+  .scan-label { font-size: 0.63rem; color: var(--accent); text-transform: uppercase; letter-spacing: 0.1em; }
+  .scan-stream { font-size: 0.8rem; font-weight: 600; line-height: 1.3; }
+  .scan-meta { font-family: 'Space Mono', monospace; font-size: 0.65rem; color: var(--muted); }
+
+  /* progress bar */
+  .progress-wrap {
+    height: 3px; background: var(--border); border-radius: 2px; overflow: hidden;
+  }
+  .progress-bar {
+    height: 100%; background: var(--accent);
+    border-radius: 2px;
+    transition: width 0.4s ease;
+    width: 0%;
+  }
+
+  /* ── giveaway feed ── */
+  .feed-area {
+    display: flex; flex-direction: column;
+    overflow: hidden;
+  }
+
+  .feed-header {
+    padding: 20px 28px 16px;
+    border-bottom: 1px solid var(--border);
+    display: flex; align-items: center; justify-content: space-between;
+  }
+
+  .feed-title { font-size: 1rem; font-weight: 800; }
+
+  .badge {
+    font-family: 'Space Mono', monospace;
+    font-size: 0.7rem; padding: 3px 10px;
+    border-radius: 20px; border: 1px solid var(--border);
+    color: var(--muted);
+  }
+  .badge.has-items { border-color: var(--accent); color: var(--accent); }
+
+  #giveaway-feed {
+    flex: 1; overflow-y: auto;
+    padding: 20px 28px;
+    display: flex; flex-direction: column; gap: 14px;
+  }
+
+  /* empty state */
+  #empty-state {
+    flex: 1; display: flex; flex-direction: column;
+    align-items: center; justify-content: center;
+    gap: 12px; color: var(--muted);
+    padding: 40px;
+  }
+  #empty-state .big-icon { font-size: 3rem; opacity: 0.3; }
+  #empty-state p { font-size: 0.85rem; text-align: center; line-height: 1.6; }
+
+  /* giveaway card */
+  .giveaway-card {
+    background: var(--card-bg);
+    border: 1px solid var(--border);
+    border-left: 3px solid var(--accent);
+    border-radius: 8px;
+    padding: 16px;
+    display: grid; grid-template-columns: 56px 1fr auto;
+    gap: 14px; align-items: center;
+    animation: slideIn 0.3s ease;
+  }
+
+  @keyframes slideIn {
+    from { opacity: 0; transform: translateY(-8px); }
+    to   { opacity: 1; transform: translateY(0); }
+  }
+
+  .giveaway-card:hover { border-color: var(--accent); box-shadow: var(--glow); }
+
+  .card-thumb {
+    width: 56px; height: 56px; border-radius: 6px;
+    object-fit: cover; background: var(--scan-col);
+    flex-shrink: 0;
+  }
+  .card-thumb-placeholder {
+    width: 56px; height: 56px; border-radius: 6px;
+    background: var(--scan-col); display: flex;
+    align-items: center; justify-content: center;
+    font-size: 1.4rem; flex-shrink: 0;
+  }
+
+  .card-info { overflow: hidden; }
+  .card-title {
+    font-weight: 700; font-size: 0.88rem;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    margin-bottom: 3px;
+  }
+  .card-seller {
+    font-family: 'Space Mono', monospace;
+    font-size: 0.68rem; color: var(--muted); margin-bottom: 6px;
+  }
+  .card-meta { display: flex; gap: 10px; align-items: center; }
+  .entry-count {
+    font-family: 'Space Mono', monospace;
+    font-size: 0.72rem; color: var(--accent);
+    background: rgba(0,255,136,0.08);
+    padding: 2px 8px; border-radius: 4px;
+  }
+  .cat-pill {
+    font-size: 0.65rem; color: var(--muted);
+    padding: 2px 8px; border: 1px solid var(--border);
+    border-radius: 4px;
+  }
+
+  .card-actions { display: flex; flex-direction: column; gap: 6px; }
+  .join-btn {
+    font-family: 'Syne', sans-serif;
+    font-size: 0.72rem; font-weight: 700;
+    padding: 8px 16px; border-radius: 5px;
+    background: var(--accent); color: #000;
+    border: none; cursor: pointer; text-decoration: none;
+    display: inline-block; text-align: center;
+    letter-spacing: 0.04em; text-transform: uppercase;
+    white-space: nowrap;
+    transition: all 0.15s;
+  }
+  .join-btn:hover { box-shadow: var(--glow); filter: brightness(1.1); }
+
+  /* scrollbar */
+  ::-webkit-scrollbar { width: 4px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
+
+  /* error banner */
+  #error-banner {
+    display: none;
+    background: rgba(255,107,53,0.1); border: 1px solid var(--accent2);
+    color: var(--accent2); padding: 10px 20px;
+    font-family: 'Space Mono', monospace; font-size: 0.72rem;
+    border-radius: 6px; margin: 12px 28px 0;
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="logo">Whatnot<span>/</span>Scanner</div>
+  <div class="status-bar">
+    <div id="status-dot"></div>
+    <div id="status-text">Not scanning</div>
+  </div>
+  <div class="controls">
+    <button id="btn-start">Start</button>
+    <button id="btn-stop" disabled>Stop</button>
+  </div>
+</header>
+
+<main>
+  <aside>
+    <div>
+      <div class="section-label">Categories</div>
+      <div class="cat-list" id="cat-list">
+        <!-- injected by JS -->
+      </div>
+    </div>
+
+    <div>
+      <div class="section-label">Stats</div>
+      <div class="stats">
+        <div class="stat-box">
+          <div class="stat-val" id="stat-scanned">0</div>
+          <div class="stat-lbl">Scanned</div>
+        </div>
+        <div class="stat-box">
+          <div class="stat-val" id="stat-found">0</div>
+          <div class="stat-lbl">Found</div>
+        </div>
+      </div>
+    </div>
+
+    <div id="now-scanning">
+      <div class="scan-label">● Now scanning</div>
+      <div class="scan-stream" id="scan-title">—</div>
+      <div class="scan-meta" id="scan-meta">—</div>
+      <div class="progress-wrap">
+        <div class="progress-bar" id="progress-bar"></div>
+      </div>
+    </div>
+  </aside>
+
+  <div class="feed-area">
+    <div class="feed-header">
+      <div class="feed-title">Live Giveaways</div>
+      <div class="badge" id="count-badge">0 detected</div>
+    </div>
+    <div id="error-banner"></div>
+    <div id="giveaway-feed">
+      <div id="empty-state">
+        <div class="big-icon">🎁</div>
+        <p>No giveaways detected yet.<br>Select categories and hit <strong>Start</strong>.</p>
+      </div>
+    </div>
+  </div>
+</main>
+
+<script>
+  const $ = id => document.getElementById(id);
+
+  // ── State ──────────────────────────────────────────────────────────────────
+  let categories     = [];
+  let selected       = new Set();
+  let giveaways      = [];
+  let scanning       = false;
+  let streamsScanned = 0;
+
+  // ── Init ───────────────────────────────────────────────────────────────────
+  async function init() {
+    const cats = await fetch('/categories').then(r => r.json());
+    categories = cats;
+    selected   = new Set(cats);   // select all by default
+    renderCategories();
+
+    // Restore state on reconnect
+    const state = await fetch('/state').then(r => r.json());
+    streamsScanned = state.streams_scanned || 0;
+    scanning       = state.scanning || false;
+    (state.giveaways || []).forEach(g => addGiveawayCard(g));
+    updateStats();
+    setScanning(scanning);
+
+    connectSSE();
+  }
+
+  // ── Category toggles ───────────────────────────────────────────────────────
+  function renderCategories() {
+    const list = $('cat-list');
+    list.innerHTML = '';
+    categories.forEach(cat => {
+      const el = document.createElement('div');
+      el.className = 'cat-toggle' + (selected.has(cat) ? ' active' : '');
+      el.dataset.cat = cat;
+      el.innerHTML = `
+        <div class="cat-check">
+          <svg width="10" height="8" viewBox="0 0 10 8" fill="none">
+            <path d="M1 4L3.5 6.5L9 1" stroke="#000" stroke-width="2" stroke-linecap="round"/>
+          </svg>
+        </div>
+        <span class="cat-name">${cat}</span>
+      `;
+      el.addEventListener('click', () => toggleCat(cat, el));
+      list.appendChild(el);
+    });
+  }
+
+  function toggleCat(cat, el) {
+    if (selected.has(cat)) {
+      selected.delete(cat);
+      el.classList.remove('active');
+    } else {
+      selected.add(cat);
+      el.classList.add('active');
+    }
+  }
+
+  // ── SSE ───────────────────────────────────────────────────────────────────
+  function connectSSE() {
+    const es = new EventSource('/events');
+
+    es.addEventListener('init', e => {
+      const data = JSON.parse(e.data);
+      if (data.scanning) setScanning(true);
+    });
+
+    es.addEventListener('status', e => {
+      const { message } = JSON.parse(e.data);
+      $('status-text').textContent = message;
+    });
+
+    es.addEventListener('scanning', e => {
+      const { title, username, viewers, scanned, total } = JSON.parse(e.data);
+      streamsScanned = scanned;
+      $('scan-title').textContent = title || 'Untitled';
+      $('scan-meta').textContent  = `@${username}  ·  ${viewers} viewers`;
+      const pct = total ? Math.round((scanned / total) * 100) : 0;
+      $('progress-bar').style.width = pct + '%';
+      $('now-scanning').classList.add('visible');
+      updateStats();
+    });
+
+    es.addEventListener('giveaway', e => {
+      const entry = JSON.parse(e.data);
+      if (!giveaways.find(g => g.stream_id === entry.stream_id)) {
+        giveaways.push(entry);
+        addGiveawayCard(entry);
+        updateStats();
+        updateBadge();
+      }
+    });
+
+    es.addEventListener('update', e => {
+      const entry = JSON.parse(e.data);
+      const el = document.querySelector(`[data-id="${entry.stream_id}"] .entry-count`);
+      if (el) el.textContent = `${entry.entry_count} entries`;
+      const existing = giveaways.find(g => g.stream_id === entry.stream_id);
+      if (existing) existing.entry_count = entry.entry_count;
+    });
+
+    es.addEventListener('error', e => {
+      const { message } = JSON.parse(e.data);
+      showError(message);
+    });
+
+    es.onerror = () => {
+      $('status-text').textContent = 'Connection lost — retrying…';
+      setTimeout(connectSSE, 3000);
+      es.close();
+    };
+  }
+
+  // ── Giveaway card ─────────────────────────────────────────────────────────
+  function addGiveawayCard(entry) {
+    const feed = $('giveaway-feed');
+    $('empty-state')?.remove();
+
+    const card = document.createElement('div');
+    card.className = 'giveaway-card';
+    card.dataset.id = entry.stream_id;
+
+    const thumbHtml = entry.thumbnail
+      ? `<img class="card-thumb" src="${entry.thumbnail}" alt="" loading="lazy">`
+      : `<div class="card-thumb-placeholder">🎁</div>`;
+
+    card.innerHTML = `
+      ${thumbHtml}
+      <div class="card-info">
+        <div class="card-title">${escHtml(entry.title)}</div>
+        <div class="card-seller">@${escHtml(entry.username)}</div>
+        <div class="card-meta">
+          <span class="entry-count">${entry.entry_count} entries</span>
+          ${entry.category ? `<span class="cat-pill">${escHtml(entry.category)}</span>` : ''}
+        </div>
+      </div>
+      <div class="card-actions">
+        <a class="join-btn" href="${entry.url}" target="_blank" rel="noopener">Join ↗</a>
+      </div>
+    `;
+
+    feed.insertBefore(card, feed.firstChild);
+  }
+
+  // ── Buttons ───────────────────────────────────────────────────────────────
+  $('btn-start').addEventListener('click', async () => {
+    if (!selected.size) { showError('Select at least one category.'); return; }
+    await fetch('/start', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ categories: [...selected] }),
+    });
+    giveaways = [];
+    streamsScanned = 0;
+    $('giveaway-feed').innerHTML = `
+      <div id="empty-state">
+        <div class="big-icon">🎁</div>
+        <p>Scanning… giveaways will appear here.</p>
+      </div>`;
+    updateStats();
+    setScanning(true);
+    hideError();
+  });
+
+  $('btn-stop').addEventListener('click', async () => {
+    await fetch('/stop', { method: 'POST' });
+    setScanning(false);
+    $('now-scanning').classList.remove('visible');
+  });
+
+  // ── Helpers ───────────────────────────────────────────────────────────────
+  function setScanning(on) {
+    scanning = on;
+    $('status-dot').className = on ? 'scanning' : '';
+    if (!on) $('status-text').textContent = 'Not scanning';
+    $('btn-start').disabled = on;
+    $('btn-stop').disabled  = !on;
+  }
+
+  function updateStats() {
+    $('stat-scanned').textContent = streamsScanned;
+    $('stat-found').textContent   = giveaways.length;
+  }
+
+  function updateBadge() {
+    const b = $('count-badge');
+    b.textContent = `${giveaways.length} detected`;
+    b.className   = 'badge' + (giveaways.length ? ' has-items' : '');
+  }
+
+  function showError(msg) {
+    const b = $('error-banner');
+    b.textContent = '⚠ ' + msg;
+    b.style.display = 'block';
+  }
+
+  function hideError() {
+    $('error-banner').style.display = 'none';
+  }
+
+  function escHtml(str) {
+    return String(str)
+      .replace(/&/g,'&amp;').replace(/</g,'&lt;')
+      .replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+  }
+
+  init();
+</script>
+</body>
+</html>
