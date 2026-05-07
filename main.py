@@ -8,8 +8,42 @@ from fetcher import get_streams
 from scanner import scan_stream, watch_giveaway
 
 DISCOVERY_CONCURRENCY = 4
+DISCOVERED_FILE       = "discovered_categories.json"
+
 from categories import CATEGORIES
 from config import update_auth, AUTH
+
+
+def _load_discovered_categories():
+    """Merge previously-discovered categories from disk into CATEGORIES."""
+    try:
+        with open(DISCOVERED_FILE, encoding="utf-8") as f:
+            extras = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return
+    if not isinstance(extras, dict):
+        return
+    for label, cid in extras.items():
+        if isinstance(label, str) and isinstance(cid, str) and label not in CATEGORIES:
+            CATEGORIES[label] = cid
+    if extras:
+        print(f"[categories] loaded {len(extras)} discovered from {DISCOVERED_FILE}")
+
+
+def _save_discovered_categories():
+    """Persist everything not in the original seed list to disk."""
+    extras = {label: cid for label, cid in CATEGORIES.items() if label not in SEED_LABELS}
+    try:
+        with open(DISCOVERED_FILE, "w", encoding="utf-8") as f:
+            json.dump(extras, f, indent=2, sort_keys=True)
+    except OSError as e:
+        print(f"[categories] failed to save: {e}")
+
+
+# Snapshot the seed labels before we merge anything from disk
+SEED_LABELS = set(CATEGORIES.keys())
+_load_discovered_categories()
+
 
 app = FastAPI()
 app.mount("/static", StaticFiles(directory="static"), name="static")
@@ -56,14 +90,122 @@ async def broadcast(event: str, data: dict):
         await q.put(msg)
 
 
+# ── Giveaway metadata extraction ─────────────────────────────────────────────
+# Speculative — these field names are guesses based on common API patterns.
+# We surface unknown fields on the card so we can refine the list once we
+# see real Whatnot payloads.
+_END_TIME_KEYS  = ("endsAt", "endsAtUtc", "endTime", "expiresAt", "closesAt", "endAt")
+_END_DELTA_KEYS = ("endsIn", "secondsRemaining", "timeRemaining", "remainingSeconds")
+_PRODUCT_NAME_KEYS = ("productName", "productTitle", "itemName", "name", "title", "description", "productDescription")
+_PRODUCT_IMAGE_KEYS = ("productImage", "imageUrl", "image", "thumbnailUrl", "thumbnail")
+_AUDIENCE_KEYS  = ("audience", "audienceType", "restrictedTo", "eligibility", "audienceFilter")
+_KNOWN_KEYS = (
+    {"entryCount", "productId"}
+    | set(_END_TIME_KEYS) | set(_END_DELTA_KEYS)
+    | set(_PRODUCT_NAME_KEYS) | set(_PRODUCT_IMAGE_KEYS)
+    | set(_AUDIENCE_KEYS)
+)
+
+
+def _coerce_unix_seconds(v) -> int | None:
+    """Best-effort: convert a candidate timestamp to a unix-seconds int."""
+    if isinstance(v, (int, float)):
+        if v <= 0:
+            return None
+        # Heuristic: > 1e11 is millis, < 1e10 is seconds
+        return int(v / 1000) if v > 1e11 else int(v)
+    if isinstance(v, str) and v:
+        try:
+            from datetime import datetime
+            dt = datetime.fromisoformat(v.replace("Z", "+00:00"))
+            return int(dt.timestamp())
+        except Exception:
+            return None
+    return None
+
+
+def _first_str(d: dict, keys) -> str | None:
+    for k in keys:
+        v = d.get(k)
+        if isinstance(v, str) and v.strip():
+            return v.strip()[:240]
+    return None
+
+
+def _extract_giveaway_meta(payload: dict) -> dict:
+    """Pull human-meaningful fields off a giveaway payload. Returns only keys
+    we recognized, plus an `unknown_fields` dict containing every payload key
+    we didn't map — surfaced on the dashboard so we can iterate."""
+    if not isinstance(payload, dict):
+        return {}
+    meta: dict = {}
+
+    # End time — absolute or relative
+    for k in _END_TIME_KEYS:
+        if k in payload:
+            ts = _coerce_unix_seconds(payload[k])
+            if ts:
+                meta["ends_at"] = ts
+                break
+    if "ends_at" not in meta:
+        for k in _END_DELTA_KEYS:
+            v = payload.get(k)
+            if isinstance(v, (int, float)) and v > 0:
+                meta["ends_at"] = int(time.time() + (v / 1000 if v > 1e6 else v))
+                break
+
+    # Product name (top-level, then nested under `product`)
+    name = _first_str(payload, _PRODUCT_NAME_KEYS)
+    p = payload.get("product")
+    if not name and isinstance(p, dict):
+        name = _first_str(p, ("name", "title", "description"))
+    if name:
+        meta["product_name"] = name
+
+    # Product image (top-level, then nested)
+    img = _first_str(payload, _PRODUCT_IMAGE_KEYS)
+    if not img and isinstance(p, dict):
+        img = _first_str(p, ("image", "imageUrl", "thumbnail"))
+    if img:
+        meta["product_image"] = img
+
+    # Audience / buyer restriction
+    aud = _first_str(payload, _AUDIENCE_KEYS)
+    if aud:
+        meta["audience"] = aud
+    else:
+        for k in ("buyersOnly", "audienceMustBeBuyer", "restrictedToBuyers"):
+            if payload.get(k) is True:
+                meta["audience"] = "buyers_only"
+                break
+
+    # Unknown fields — preserve simple-typed values verbatim so we can spot
+    # candidate field names from the dashboard.
+    unknown = {}
+    for k, v in payload.items():
+        if k in _KNOWN_KEYS:
+            continue
+        if isinstance(v, (str, int, float, bool)):
+            sv = str(v)
+            unknown[k] = sv if len(sv) <= 80 else sv[:77] + "…"
+    if unknown:
+        meta["unknown_fields"] = unknown
+
+    return meta
+
+
 # ── Watcher callbacks ────────────────────────────────────────────────────────
 async def on_watcher_update(stream: dict, payload: dict):
-    """Entry count update from a long-running watcher connection."""
+    """Entry count + metadata update from a long-running watcher connection."""
     sid = stream["id"]
     existing = next((g for g in state["giveaways"] if g["stream_id"] == sid), None)
     if not existing:
         return
     existing["entry_count"] = payload.get("entryCount", existing["entry_count"])
+    # Re-extract every update so end-time/audience/etc. stay fresh
+    meta = _extract_giveaway_meta(payload)
+    for k, v in meta.items():
+        existing[k] = v
     await broadcast("update", existing)
 
 
@@ -130,6 +272,7 @@ async def on_giveaway(stream: dict, payload: dict):
         "url":         stream.get("url", f"https://www.whatnot.com/live/{stream_id}"),
         "started_at":  int(time.time()),
     }
+    entry.update(_extract_giveaway_meta(payload))
     state["giveaways"].append(entry)
     await broadcast("giveaway", entry)
     _start_watcher(stream)
@@ -305,6 +448,7 @@ async def categories_discovered(request: Request):
 
     if added:
         print(f"[categories] discovered {len(added)}: {[a['label'] for a in added]}")
+        _save_discovered_categories()
         await broadcast("categories_updated", {
             "added":   added,
             "all":     sorted(CATEGORIES.keys()),

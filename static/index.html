@@ -301,7 +301,7 @@
     font-family: 'Space Mono', monospace;
     font-size: 0.68rem; color: var(--muted); margin-bottom: 6px;
   }
-  .card-meta { display: flex; gap: 10px; align-items: center; }
+  .card-meta { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
   .entry-count {
     font-family: 'Space Mono', monospace;
     font-size: 0.72rem; color: var(--accent);
@@ -312,6 +312,42 @@
     font-size: 0.65rem; color: var(--muted);
     padding: 2px 8px; border: 1px solid var(--border);
     border-radius: 4px;
+  }
+  .timer-pill {
+    font-family: 'Space Mono', monospace;
+    font-size: 0.72rem;
+    padding: 2px 8px; border-radius: 4px;
+    color: var(--accent2);
+    background: rgba(255,107,53,0.08);
+  }
+  .timer-pill.urgent {
+    color: #fff;
+    background: var(--accent2);
+    animation: pulse 1.2s ease-in-out infinite;
+  }
+  .audience-pill {
+    font-size: 0.65rem; padding: 2px 8px; border-radius: 4px;
+    color: var(--accent); border: 1px solid var(--accent);
+    background: rgba(0,255,136,0.06);
+    text-transform: uppercase; letter-spacing: 0.04em;
+  }
+  .product-line {
+    font-size: 0.74rem; color: var(--text); opacity: 0.85;
+    margin-top: 6px;
+    overflow: hidden; text-overflow: ellipsis;
+    display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
+  }
+  .unknown-fields {
+    font-family: 'Space Mono', monospace;
+    font-size: 0.62rem; color: var(--muted);
+    margin-top: 6px;
+    word-break: break-all;
+    line-height: 1.4;
+  }
+  .unknown-fields .lbl {
+    color: var(--accent2); opacity: 0.8;
+    text-transform: uppercase; letter-spacing: 0.06em;
+    margin-right: 4px; font-size: 0.58rem;
   }
 
   .card-actions { display: flex; flex-direction: column; gap: 6px; }
@@ -696,10 +732,9 @@
 
     es.addEventListener('update', e => {
       const entry = JSON.parse(e.data);
-      const el = document.querySelector(`[data-id="${entry.stream_id}"] .entry-count`);
-      if (el) el.textContent = `${entry.entry_count} entries`;
       const existing = giveaways.find(g => g.stream_id === entry.stream_id);
-      if (existing) existing.entry_count = entry.entry_count;
+      if (existing) Object.assign(existing, entry);
+      refreshCardBody(entry);
     });
 
     es.addEventListener('categories_updated', e => {
@@ -715,6 +750,7 @@
 
     es.addEventListener('giveaway_ended', e => {
       const { stream_id } = JSON.parse(e.data);
+      stopCardTimer(stream_id);
       const card = document.querySelector(`.giveaway-card[data-id="${stream_id}"]`);
       if (card) {
         card.classList.add('ending');
@@ -745,6 +781,72 @@
   }
 
   // ── Giveaway card ─────────────────────────────────────────────────────────
+  // stream_id → setInterval handle for the countdown timer
+  const cardTimers = new Map();
+
+  function fmtRemaining(secs) {
+    if (secs < 0) secs = 0;
+    const m = Math.floor(secs / 60);
+    const s = secs % 60;
+    if (m >= 60) {
+      const h = Math.floor(m / 60);
+      return `${h}h ${m % 60}m`;
+    }
+    return `${m}:${String(s).padStart(2, '0')}`;
+  }
+
+  function startCardTimer(streamId, endsAtSec) {
+    stopCardTimer(streamId);
+    const card = document.querySelector(`.giveaway-card[data-id="${streamId}"]`);
+    if (!card) return;
+    const el = card.querySelector('.timer-pill');
+    if (!el) return;
+    const tick = () => {
+      const remaining = endsAtSec - Math.floor(Date.now() / 1000);
+      el.textContent = '⏱ ' + fmtRemaining(Math.max(0, remaining));
+      el.classList.toggle('urgent', remaining > 0 && remaining <= 30);
+      if (remaining <= 0) stopCardTimer(streamId);
+    };
+    tick();
+    cardTimers.set(streamId, setInterval(tick, 1000));
+  }
+
+  function stopCardTimer(streamId) {
+    const id = cardTimers.get(streamId);
+    if (id) { clearInterval(id); cardTimers.delete(streamId); }
+  }
+
+  function renderCardBody(entry) {
+    const audience = entry.audience
+      ? `<span class="audience-pill">👤 ${escHtml(entry.audience)}</span>`
+      : '';
+    const timer = (typeof entry.ends_at === 'number')
+      ? `<span class="timer-pill">⏱ —</span>`
+      : '';
+    const product = entry.product_name
+      ? `<div class="product-line">📦 ${escHtml(entry.product_name)}</div>`
+      : '';
+    const unknown = entry.unknown_fields && Object.keys(entry.unknown_fields).length
+      ? `<div class="unknown-fields"><span class="lbl">unmapped:</span>${
+          Object.entries(entry.unknown_fields)
+            .map(([k, v]) => `${escHtml(k)}=${escHtml(String(v))}`)
+            .join(' · ')
+        }</div>`
+      : '';
+    return `
+      <div class="card-title">${escHtml(entry.title)}</div>
+      <div class="card-seller">@${escHtml(entry.username)}</div>
+      <div class="card-meta">
+        <span class="entry-count">${entry.entry_count} entries</span>
+        ${entry.category ? `<span class="cat-pill">${escHtml(entry.category)}</span>` : ''}
+        ${timer}
+        ${audience}
+      </div>
+      ${product}
+      ${unknown}
+    `;
+  }
+
   function addGiveawayCard(entry) {
     const feed = $('giveaway-feed');
     $('empty-state')?.remove();
@@ -760,12 +862,7 @@
     card.innerHTML = `
       ${thumbHtml}
       <div class="card-info">
-        <div class="card-title">${escHtml(entry.title)}</div>
-        <div class="card-seller">@${escHtml(entry.username)}</div>
-        <div class="card-meta">
-          <span class="entry-count">${entry.entry_count} entries</span>
-          ${entry.category ? `<span class="cat-pill">${escHtml(entry.category)}</span>` : ''}
-        </div>
+        ${renderCardBody(entry)}
       </div>
       <div class="card-actions">
         <a class="join-btn" href="${entry.url}" target="_blank" rel="noopener">Join ↗</a>
@@ -773,6 +870,19 @@
     `;
 
     feed.insertBefore(card, feed.firstChild);
+    if (typeof entry.ends_at === 'number') startCardTimer(entry.stream_id, entry.ends_at);
+  }
+
+  function refreshCardBody(entry) {
+    const card = document.querySelector(`.giveaway-card[data-id="${entry.stream_id}"]`);
+    if (!card) return;
+    const info = card.querySelector('.card-info');
+    if (info) info.innerHTML = renderCardBody(entry);
+    if (typeof entry.ends_at === 'number') {
+      startCardTimer(entry.stream_id, entry.ends_at);
+    } else {
+      stopCardTimer(entry.stream_id);
+    }
   }
 
   // ── Buttons ───────────────────────────────────────────────────────────────
