@@ -314,6 +314,38 @@
     font-family: 'Space Mono', monospace; font-size: 0.72rem;
     border-radius: 6px; margin: 12px 28px 0;
   }
+
+  /* auth expired banner — sticky, prominent */
+  #auth-banner {
+    display: none;
+    background: rgba(255,107,53,0.12);
+    border: 1px solid var(--accent2); border-left: 4px solid var(--accent2);
+    color: var(--text); padding: 14px 18px;
+    border-radius: 6px; margin: 12px 28px 0;
+    display: none;
+  }
+  #auth-banner.visible { display: block; }
+  #auth-banner .auth-title {
+    font-family: 'Syne', sans-serif; font-weight: 800;
+    font-size: 0.85rem; color: var(--accent2);
+    text-transform: uppercase; letter-spacing: 0.06em;
+    margin-bottom: 6px;
+  }
+  #auth-banner .auth-body {
+    font-family: 'Space Mono', monospace; font-size: 0.72rem;
+    color: var(--text); opacity: 0.85; line-height: 1.5;
+  }
+  #auth-banner code {
+    background: rgba(255,255,255,0.06); padding: 1px 6px;
+    border-radius: 3px; font-size: 0.7rem;
+  }
+
+  /* status-dot auth state */
+  #status-dot.auth-fail {
+    background: var(--accent2);
+    box-shadow: 0 0 8px var(--accent2);
+    animation: none;
+  }
 </style>
 </head>
 <body>
@@ -367,6 +399,15 @@
     <div class="feed-header">
       <div class="feed-title">Live Giveaways</div>
       <div class="badge" id="count-badge">0 detected</div>
+    </div>
+    <div id="auth-banner">
+      <div class="auth-title">⚠ Session tokens expired</div>
+      <div class="auth-body" id="auth-body">
+        Whatnot rejected the WebSocket with <code>403</code>.
+        Open <code>whatnot.com</code> → DevTools → <code>WS</code> tab → copy the fresh
+        <code>_csrf_token</code> and <code>sessionExtensionToken</code> from the auction socket URL,
+        plus a fresh <code>Cookie</code> from any request, into <code>.env</code>. Then restart the server.
+      </div>
     </div>
     <div id="error-banner"></div>
     <div id="giveaway-feed">
@@ -444,6 +485,25 @@
     es.addEventListener('init', e => {
       const data = JSON.parse(e.data);
       if (data.scanning) setScanning(true);
+      if (data.auth_expired) showAuthBanner();
+    });
+
+    es.addEventListener('auth_expired', e => {
+      const { message } = JSON.parse(e.data);
+      showAuthBanner(message);
+      setScanning(false);
+      $('now-scanning').classList.remove('visible');
+      $('status-dot').className = 'auth-fail';
+      $('status-text').textContent = 'Tokens expired';
+    });
+
+    es.addEventListener('auth_refreshed', e => {
+      hideAuthBanner();
+      $('status-dot').className = scanning ? 'scanning' : '';
+      $('status-text').textContent = '✓ Tokens refreshed';
+      setTimeout(() => {
+        if (!scanning) $('status-text').textContent = 'Not scanning';
+      }, 3000);
     });
 
     es.addEventListener('status', e => {
@@ -541,6 +601,7 @@
     updateStats();
     setScanning(true);
     hideError();
+    hideAuthBanner();
   });
 
   $('btn-stop').addEventListener('click', async () => {
@@ -577,6 +638,15 @@
 
   function hideError() {
     $('error-banner').style.display = 'none';
+  }
+
+  function showAuthBanner(customMessage) {
+    if (customMessage) $('auth-body').textContent = customMessage;
+    $('auth-banner').classList.add('visible');
+  }
+
+  function hideAuthBanner() {
+    $('auth-banner').classList.remove('visible');
   }
 
   function escHtml(str) {

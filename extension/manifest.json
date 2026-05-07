@@ -1,0 +1,31 @@
+{
+  "manifest_version": 3,
+  "name": "Whatnot Token Pusher",
+  "version": "1.0.0",
+  "description": "Auto-pushes Whatnot session tokens to your local Whatnot Scanner server.",
+  "permissions": ["cookies", "storage"],
+  "host_permissions": [
+    "https://*.whatnot.com/*",
+    "http://localhost:5000/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://*.whatnot.com/*"],
+      "js": ["inject.js"],
+      "run_at": "document_start",
+      "world": "MAIN"
+    },
+    {
+      "matches": ["https://*.whatnot.com/*"],
+      "js": ["content.js"],
+      "run_at": "document_start"
+    }
+  ],
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Whatnot Token Pusher"
+  }
+}

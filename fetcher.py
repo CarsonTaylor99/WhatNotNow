@@ -1,18 +1,20 @@
 import httpx
-from config import GRAPHQL_URL, COOKIE, CLIENT_VERSION
+from config import GRAPHQL_URL, AUTH
 
-HEADERS = {
-    "Content-Type": "application/json",
-    "Cookie": COOKIE,
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        f"Chrome/147.0.0.0 Safari/537.36"
-    ),
-    "Origin": "https://www.whatnot.com",
-    "Referer": "https://www.whatnot.com/live",
-    "x-client-version": CLIENT_VERSION,
-}
+
+def _build_headers() -> dict:
+    return {
+        "Content-Type": "application/json",
+        "Cookie": AUTH["cookie"],
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/147.0.0.0 Safari/537.36"
+        ),
+        "Origin": "https://www.whatnot.com",
+        "Referer": "https://www.whatnot.com/live",
+        "x-client-version": AUTH["client_version"],
+    }
 
 EXPLORE_QUERY = """
 query LiveStreamExplore($id: ID!) {
@@ -70,7 +72,7 @@ async def get_streams(explore_id: str) -> dict:
                     "variables": {"id": explore_id},
                     "query": EXPLORE_QUERY,
                 },
-                headers=HEADERS,
+                headers=_build_headers(),
             )
             resp.raise_for_status()
             data = resp.json()

@@ -1,11 +1,13 @@
 import asyncio
 import json
+import time
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fetcher import get_streams
 from scanner import scan_stream
 from categories import CATEGORIES
+from config import update_auth, AUTH
 
 app = FastAPI()
 app.mount("/static", StaticFiles(directory="static"), name="static")
@@ -19,6 +21,7 @@ state = {
     "total_streams":      0,
     "selected_categories": [],
     "error":              None,
+    "auth_expired":       False,
 }
 
 _sse_clients: list[asyncio.Queue] = []
@@ -58,12 +61,27 @@ async def on_giveaway(stream: dict, payload: dict):
     await broadcast("giveaway", entry)
 
 
+# ── Auth-expired callback (called by scanner on 403) ──────────────────────────
+async def on_auth_expired():
+    if state["auth_expired"]:
+        return  # already broadcast for this run
+    state["auth_expired"] = True
+    state["error"] = "Session tokens expired"
+    await broadcast("auth_expired", {
+        "message": "Session tokens expired. Open whatnot.com → DevTools → WS → "
+                   "copy fresh _csrf_token, sessionExtensionToken, and Cookie "
+                   "into .env, then restart the server."
+    })
+    _stop_event.set()
+
+
 # ── Main scanner loop ─────────────────────────────────────────────────────────
 async def run_scanner():
     _stop_event.clear()
     state["streams_scanned"] = 0
     state["giveaways"]       = []
     state["error"]           = None
+    state["auth_expired"]    = False
 
     try:
         while not _stop_event.is_set():
@@ -101,7 +119,7 @@ async def run_scanner():
                         "total":    len(streams),
                     })
 
-                    await scan_stream(stream, on_giveaway)
+                    await scan_stream(stream, on_giveaway, on_auth_expired)
 
             if not _stop_event.is_set():
                 # Brief pause between full cycles
@@ -173,6 +191,103 @@ async def start_scan(request: Request):
 async def stop_scan():
     _stop_event.set()
     state["scanning"] = False
+    return {"ok": True}
+
+
+def _trunc(s: str, n: int = 12) -> str:
+    return f"{s[:n]}…{s[-6:]}" if len(s) > n + 6 else s
+
+
+@app.post("/auth/refresh")
+async def refresh_auth(request: Request):
+    """Receives fresh tokens from the Chrome extension and hot-swaps them."""
+    body           = await request.json()
+    cookie         = (body.get("cookie") or "").strip()
+    csrf_token     = (body.get("csrf_token") or "").strip()
+    session_token  = (body.get("session_token") or "").strip()
+    client_version = (body.get("client_version") or "").strip()
+    socket_kind    = (body.get("socket_kind") or "auction").strip()
+
+    if not (cookie and csrf_token and session_token):
+        print(f"[auth] refresh REJECTED — missing fields "
+              f"(cookie={len(cookie)}, csrf={len(csrf_token)}, session={len(session_token)})")
+        return {"ok": False, "error": "missing fields"}
+
+    update_auth(cookie, csrf_token, session_token, client_version, socket_kind)
+    state["auth_expired"] = False
+    state["error"]        = None
+
+    at = int(time.time())
+    print(f"[auth] {socket_kind} refreshed at {time.strftime('%H:%M:%S')} → "
+          f"cookie={len(cookie)}ch, csrf={_trunc(csrf_token)}, "
+          f"session={_trunc(session_token)}, client_version={client_version or '(unchanged)'}")
+    await broadcast("auth_refreshed", {"message": "Tokens refreshed", "at": at})
+    return {"ok": True, "at": at}
+
+
+@app.get("/auth/status")
+async def auth_status():
+    """Inspect what the server currently has in memory."""
+    return {
+        "cookie_len":         len(AUTH["cookie"]),
+        "cookie_preview":     _trunc(AUTH["cookie"], 30),
+        "csrf_token":         _trunc(AUTH["csrf_token"]),
+        "csrf_token_full":    AUTH["csrf_token"],
+        "session_token":      _trunc(AUTH["session_token"]),
+        "session_token_full": AUTH["session_token"],
+        "client_version":     AUTH["client_version"],
+    }
+
+
+@app.get("/auth/full")
+async def auth_full():
+    """Full AUTH dict — used by debug tooling to read live state.
+    Localhost-only sensitive endpoint."""
+    return dict(AUTH)
+
+
+# ── Captured phx_join store (for diagnostics) ─────────────────────────────────
+captured_joins: list[dict] = []
+
+
+@app.post("/capture/join")
+async def capture_join(request: Request):
+    body    = await request.json()
+    payload = body.get("payload") or {}
+    captured_joins.append({
+        "at":         int(time.time()),
+        "socketKind": body.get("socketKind"),
+        "topic":      body.get("topic"),
+        "payload":    payload,
+    })
+    if len(captured_joins) > 100:
+        del captured_joins[:-100]
+
+    # Stash livestreamSessionId for the scanner to reuse across streams.
+    if isinstance(payload, dict):
+        sid = payload.get("livestreamSessionId")
+        if sid and sid != AUTH.get("livestream_session_id"):
+            AUTH["livestream_session_id"] = sid
+            print(f"[capture] livestream_session_id captured: {_trunc(sid)}")
+    return {"ok": True}
+
+
+@app.get("/capture/joins")
+async def list_joins():
+    """Returns unique topics seen, with their socketKind and most-recent payload."""
+    by_topic: dict[str, dict] = {}
+    for j in captured_joins:
+        by_topic[j["topic"]] = j
+    return {
+        "total_captured": len(captured_joins),
+        "unique_topics":  sorted(by_topic.keys()),
+        "details":        list(by_topic.values()),
+    }
+
+
+@app.post("/capture/clear")
+async def clear_joins():
+    captured_joins.clear()
     return {"ok": True}
 
 
