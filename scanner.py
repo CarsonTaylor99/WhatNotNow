@@ -219,9 +219,16 @@ async def _watch_attempt(
     on_event_seen,
     stop_event: asyncio.Event | None,
     deadline: float,
+    idle_state: dict,
     idle_timeout: int = IDLE_TIMEOUT,
 ) -> tuple[str, str | None]:
     """One connect+listen attempt. Returns (status, reason).
+
+    idle_state["last_entry_at"] is the wall-clock time of the most recent
+    giveaway_entry_count_updated event seen by ANY attempt for this watcher.
+    Persisting it across reconnects is what makes idle-timeout actually
+    work — otherwise a flapping WS would reset the timer on every connect.
+
     status:
       "explicit_end"  — saw a known end event OR idle-timed-out (terminal)
       "max_watch"     — deadline reached (terminal)
@@ -241,7 +248,6 @@ async def _watch_attempt(
         return str(ref)
 
     join_accepted = False
-    last_update_at = asyncio.get_event_loop().time()  # idle timer reference
 
     try:
         async with websockets.connect(
@@ -261,10 +267,11 @@ async def _watch_attempt(
                     if stop_event and stop_event.is_set():
                         return ("stopped", None)
 
-                    # Idle-timeout: if no entry update in N sec, giveaway is
-                    # almost certainly over — Whatnot tends to just stop firing
-                    # entry events rather than send an explicit ended event.
-                    if asyncio.get_event_loop().time() - last_update_at > idle_timeout:
+                    # Idle-timeout: if no entry update in N sec (across all
+                    # reconnect attempts), giveaway is almost certainly over —
+                    # Whatnot tends to just stop firing entry events rather
+                    # than send an explicit ended event.
+                    if asyncio.get_event_loop().time() - idle_state["last_entry_at"] > idle_timeout:
                         return ("explicit_end", "idle_timeout")
 
                     remaining = deadline - asyncio.get_event_loop().time()
@@ -296,7 +303,7 @@ async def _watch_attempt(
                             pass
 
                     if event == "giveaway_entry_count_updated":
-                        last_update_at = asyncio.get_event_loop().time()
+                        idle_state["last_entry_at"] = asyncio.get_event_loop().time()
                         await on_update(stream, payload)
                     elif event in GIVEAWAY_END_EVENTS:
                         return ("explicit_end", event)
@@ -352,8 +359,11 @@ async def watch_giveaway(
         await on_ended(stream, "no_session_id")
         return
 
-    deadline       = asyncio.get_event_loop().time() + max_seconds
-    consec_fails   = 0  # transient closes in a row without a productive run
+    deadline     = asyncio.get_event_loop().time() + max_seconds
+    consec_fails = 0  # transient closes in a row without a productive run
+
+    # Persisted across reconnects so flapping doesn't reset the idle timer.
+    idle_state = {"last_entry_at": asyncio.get_event_loop().time()}
 
     while True:
         if stop_event and stop_event.is_set():
@@ -362,9 +372,15 @@ async def watch_giveaway(
         if asyncio.get_event_loop().time() >= deadline:
             await on_ended(stream, "max_watch_reached")
             return
+        # Idle check at outer-loop boundary too — covers the case where every
+        # _watch_attempt is closing fast (so the inner check never fires)
+        # but no entry events are arriving in between.
+        if asyncio.get_event_loop().time() - idle_state["last_entry_at"] > IDLE_TIMEOUT:
+            await on_ended(stream, "idle_timeout")
+            return
 
         status, reason = await _watch_attempt(
-            stream, on_update, on_event_seen, stop_event, deadline,
+            stream, on_update, on_event_seen, stop_event, deadline, idle_state,
         )
 
         if status == "explicit_end":

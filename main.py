@@ -168,10 +168,19 @@ def _extract_giveaway_meta(payload: dict) -> dict:
     active   = payload.get("activeGiveaway") if isinstance(payload.get("activeGiveaway"), dict) else None
     pinned   = payload.get("pinnedProduct")  if isinstance(payload.get("pinnedProduct"),  dict) else None
     product  = payload.get("product")        if isinstance(payload.get("product"),        dict) else None
+    # If activeGiveaway has a nested product object, prefer that
+    active_product = (
+        active.get("product")
+        if active and isinstance(active.get("product"), dict)
+        else None
+    )
 
-    # Search order matters: nested giveaway state first, then top-level
-    end_sources     = [s for s in (active, payload) if isinstance(s, dict)]
-    product_sources = [s for s in (pinned, active, product, payload) if isinstance(s, dict)]
+    # Search order:
+    # - End time / audience: only from giveaway-state sources
+    # - Product info: ONLY from giveaway sources, never pinnedProduct
+    #   (pinnedProduct is the active auction item, NOT the giveaway).
+    end_sources      = [s for s in (active, payload) if isinstance(s, dict)]
+    product_sources  = [s for s in (active_product, active, product) if isinstance(s, dict)]
     audience_sources = [s for s in (active, payload) if isinstance(s, dict)]
 
     # End time
