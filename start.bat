@@ -2,19 +2,53 @@
 setlocal EnableDelayedExpansion
 title Whatnot Scanner
 
-REM Save the script's folder BEFORE we shift directories. Use pushd because
-REM it handles UNC paths (\\wsl.localhost\...) by mapping them to a temp
-REM drive letter — plain `cd /d` can't do that and would land in C:\Windows.
+REM Resolve the script's folder, stripping the trailing backslash. The
+REM trailing \ is what was breaking the previous version: when the path
+REM ended up inside quotes (e.g. ...\"), cmd parsed it as an escaped quote,
+REM scrambled the if-block paren matching, and aborted the whole script
+REM silently before any pause could run.
 set "SCRIPT_DIR=%~dp0"
-pushd "%SCRIPT_DIR%" 2>nul
+if "!SCRIPT_DIR:~-1!"=="\" set "SCRIPT_DIR=!SCRIPT_DIR:~0,-1!"
+
+echo.
+echo === Whatnot Scanner ===
+echo Folder: !SCRIPT_DIR!
+echo.
+
+REM pushd handles UNC paths (\\wsl.localhost\...) by mapping to a temp drive.
+pushd "!SCRIPT_DIR!"
 if errorlevel 1 (
-    echo ERROR: Could not enter script folder.
-    echo Path: %SCRIPT_DIR%
+    echo ERROR: Could not enter folder.
     pause
     exit /b 1
 )
 
-REM ── Native Windows venv ────────────────────────────────────────────────────
+REM ── Linux venv (WSL setup) — checked first because that's the common case ─
+if exist ".venv\bin\python" (
+    echo Detected WSL/Linux venv. Routing through WSL...
+
+    REM Convert this folder to its Linux path. Pipe the trimmed SCRIPT_DIR
+    REM (no trailing slash) so wslpath -u sees a clean argument.
+    set "WSL_PATH="
+    for /f "usebackq delims=" %%i in (`wsl wslpath -u "!SCRIPT_DIR!"`) do set "WSL_PATH=%%i"
+
+    if "!WSL_PATH!"=="" (
+        echo.
+        echo Could not get WSL path. Open a WSL terminal and run:
+        echo   cd ~/WhatNotNow ^&^& .venv/bin/python main.py
+        echo.
+        goto :stopped
+    )
+
+    echo WSL path: !WSL_PATH!
+    echo Dashboard: http://localhost:5000
+    echo Press Ctrl+C to stop.
+    echo.
+    wsl --cd "!WSL_PATH!" .venv/bin/python main.py
+    goto :stopped
+)
+
+REM ── Windows-native venv ────────────────────────────────────────────────────
 if exist ".venv\Scripts\python.exe" (
     echo Starting Whatnot Scanner (native Windows venv)...
     echo Dashboard: http://localhost:5000
@@ -24,39 +58,13 @@ if exist ".venv\Scripts\python.exe" (
     goto :stopped
 )
 
-REM ── WSL/Linux venv — invoke through WSL ────────────────────────────────────
-if exist ".venv\bin\python" (
-    echo Detected Linux virtualenv. Project is in WSL — invoking via WSL...
-
-    REM Convert script path to WSL path (e.g.,
-    REM \\wsl.localhost\Ubuntu\home\claude\WhatNotNow\  →  /home/claude/WhatNotNow)
-    for /f "delims=" %%i in ('wsl wslpath -u "%SCRIPT_DIR%" 2^>nul') do set "WSL_PATH=%%i"
-
-    if "!WSL_PATH!"=="" (
-        echo Could not convert path to WSL format.
-        echo Open a WSL terminal and run manually:
-        echo   cd ~/WhatNotNow
-        echo   .venv/bin/python main.py
-        goto :stopped
-    )
-
-    REM Strip trailing slash
-    if "!WSL_PATH:~-1!"=="/" set "WSL_PATH=!WSL_PATH:~0,-1!"
-
-    echo WSL working dir: !WSL_PATH!
-    echo Dashboard: http://localhost:5000
-    echo Press Ctrl+C to stop.
-    echo.
-    wsl --cd "!WSL_PATH!" .venv/bin/python main.py
-    goto :stopped
-)
-
-echo No virtualenv found.
-echo Looked for: .venv\Scripts\python.exe (Windows) or .venv\bin\python (WSL).
-echo Run setup.bat to create one.
+echo.
+echo No virtualenv found in !SCRIPT_DIR!\.venv
+echo Looked for both .venv\bin\python (WSL) and .venv\Scripts\python.exe (Windows).
+echo Run setup.bat to create one, or check that you're in the right folder.
 
 :stopped
 echo.
-echo Server stopped.
+echo === Server stopped ===
 popd
 pause
