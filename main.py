@@ -91,16 +91,20 @@ async def broadcast(event: str, data: dict):
 
 
 # ── Giveaway metadata extraction ─────────────────────────────────────────────
-# Speculative — these field names are guesses based on common API patterns.
-# We surface unknown fields on the card so we can refine the list once we
-# see real Whatnot payloads.
-_END_TIME_KEYS  = ("endsAt", "endsAtUtc", "endTime", "expiresAt", "closesAt", "endAt")
+# Field names confirmed from real Whatnot payloads. Giveaway state lives
+# nested inside `activeGiveaway`; product info lives in `pinnedProduct`.
+# We still iterate via candidate lists so future schema changes are easy.
+_END_TIME_KEYS  = ("endsAt", "endsAtUtc", "expiresAt", "closesAt", "endAt", "endTime")
 _END_DELTA_KEYS = ("endsIn", "secondsRemaining", "timeRemaining", "remainingSeconds")
-_PRODUCT_NAME_KEYS = ("productName", "productTitle", "itemName", "name", "title", "description", "productDescription")
+_PRODUCT_NAME_KEYS  = ("title", "productName", "productTitle", "itemName", "name", "description", "productDescription")
 _PRODUCT_IMAGE_KEYS = ("productImage", "imageUrl", "image", "thumbnailUrl", "thumbnail")
-_AUDIENCE_KEYS  = ("audience", "audienceType", "restrictedTo", "eligibility", "audienceFilter")
-_KNOWN_KEYS = (
-    {"entryCount", "productId"}
+_AUDIENCE_KEYS      = ("audience", "audienceType", "restrictedTo", "eligibility", "audienceFilter")
+
+# Top-level keys we recognize — anything else lands in unknown_fields so we
+# can keep refining the parser.
+_KNOWN_TOP_KEYS = (
+    {"entryCount", "productId", "activeGiveaway", "pinnedProduct", "product",
+     "requireQualifiedBuyer", "buyerQualifications"}
     | set(_END_TIME_KEYS) | set(_END_DELTA_KEYS)
     | set(_PRODUCT_NAME_KEYS) | set(_PRODUCT_IMAGE_KEYS)
     | set(_AUDIENCE_KEYS)
@@ -132,62 +136,112 @@ def _first_str(d: dict, keys) -> str | None:
     return None
 
 
+def _summarize(v, depth=0) -> str:
+    """Compact stringy summary of any value — used to surface nested
+    objects in unknown_fields so the dashboard shows what's actually
+    inside activeGiveaway / pinnedProduct without dumping JSON walls."""
+    if isinstance(v, (str, int, float, bool)) or v is None:
+        s = str(v)
+        return s if len(s) <= 60 else s[:57] + "…"
+    if isinstance(v, list):
+        return f"[{len(v)} items]"
+    if isinstance(v, dict):
+        if depth >= 2:
+            return "{…}"
+        items = []
+        for ik, iv in list(v.items())[:8]:
+            items.append(f"{ik}={_summarize(iv, depth + 1)}")
+        more = len(v) - len(items)
+        return "{" + ", ".join(items) + (f", …+{more}" if more > 0 else "") + "}"
+    return type(v).__name__
+
+
 def _extract_giveaway_meta(payload: dict) -> dict:
-    """Pull human-meaningful fields off a giveaway payload. Returns only keys
-    we recognized, plus an `unknown_fields` dict containing every payload key
-    we didn't map — surfaced on the dashboard so we can iterate."""
+    """Pull human-meaningful fields off a giveaway payload, looking inside
+    nested `activeGiveaway` and `pinnedProduct` objects where Whatnot
+    actually stores most of this state. Anything we don't recognize lands
+    in unknown_fields so the dashboard keeps surfacing new fields."""
     if not isinstance(payload, dict):
         return {}
     meta: dict = {}
 
-    # End time — absolute or relative
-    for k in _END_TIME_KEYS:
-        if k in payload:
-            ts = _coerce_unix_seconds(payload[k])
-            if ts:
-                meta["ends_at"] = ts
-                break
+    active   = payload.get("activeGiveaway") if isinstance(payload.get("activeGiveaway"), dict) else None
+    pinned   = payload.get("pinnedProduct")  if isinstance(payload.get("pinnedProduct"),  dict) else None
+    product  = payload.get("product")        if isinstance(payload.get("product"),        dict) else None
+
+    # Search order matters: nested giveaway state first, then top-level
+    end_sources     = [s for s in (active, payload) if isinstance(s, dict)]
+    product_sources = [s for s in (pinned, active, product, payload) if isinstance(s, dict)]
+    audience_sources = [s for s in (active, payload) if isinstance(s, dict)]
+
+    # End time
+    for src in end_sources:
+        for k in _END_TIME_KEYS:
+            if k in src:
+                ts = _coerce_unix_seconds(src[k])
+                if ts:
+                    meta["ends_at"] = ts
+                    break
+        if "ends_at" in meta:
+            break
     if "ends_at" not in meta:
-        for k in _END_DELTA_KEYS:
-            v = payload.get(k)
-            if isinstance(v, (int, float)) and v > 0:
-                meta["ends_at"] = int(time.time() + (v / 1000 if v > 1e6 else v))
+        for src in end_sources:
+            for k in _END_DELTA_KEYS:
+                v = src.get(k)
+                if isinstance(v, (int, float)) and v > 0:
+                    meta["ends_at"] = int(time.time() + (v / 1000 if v > 1e6 else v))
+                    break
+            if "ends_at" in meta:
                 break
 
-    # Product name (top-level, then nested under `product`)
-    name = _first_str(payload, _PRODUCT_NAME_KEYS)
-    p = payload.get("product")
-    if not name and isinstance(p, dict):
-        name = _first_str(p, ("name", "title", "description"))
-    if name:
-        meta["product_name"] = name
+    # Product name
+    for src in product_sources:
+        name = _first_str(src, _PRODUCT_NAME_KEYS)
+        if name:
+            meta["product_name"] = name
+            break
 
-    # Product image (top-level, then nested)
-    img = _first_str(payload, _PRODUCT_IMAGE_KEYS)
-    if not img and isinstance(p, dict):
-        img = _first_str(p, ("image", "imageUrl", "thumbnail"))
-    if img:
-        meta["product_image"] = img
+    # Product image
+    for src in product_sources:
+        img = _first_str(src, _PRODUCT_IMAGE_KEYS)
+        if img:
+            meta["product_image"] = img
+            break
 
     # Audience / buyer restriction
-    aud = _first_str(payload, _AUDIENCE_KEYS)
+    aud = None
+    for src in audience_sources:
+        aud = _first_str(src, _AUDIENCE_KEYS)
+        if aud:
+            break
     if aud:
         meta["audience"] = aud
+    elif payload.get("requireQualifiedBuyer") is True:
+        meta["audience"] = "qualified_buyer"
     else:
         for k in ("buyersOnly", "audienceMustBeBuyer", "restrictedToBuyers"):
             if payload.get(k) is True:
                 meta["audience"] = "buyers_only"
                 break
 
-    # Unknown fields — preserve simple-typed values verbatim so we can spot
-    # candidate field names from the dashboard.
+    # Unknown fields — strings/numbers/bools verbatim; nested objects
+    # get a key-summary so we can see *what's inside* without paging
+    # through /payload_samples.
     unknown = {}
     for k, v in payload.items():
-        if k in _KNOWN_KEYS:
+        if k in _KNOWN_TOP_KEYS:
             continue
         if isinstance(v, (str, int, float, bool)):
             sv = str(v)
             unknown[k] = sv if len(sv) <= 80 else sv[:77] + "…"
+        elif isinstance(v, (dict, list)) and v:
+            unknown[k] = _summarize(v)
+    # Always surface activeGiveaway + pinnedProduct contents, even though
+    # we extracted from them — helps spot fields we *should* be mapping.
+    if active:
+        unknown["activeGiveaway"] = _summarize(active)
+    if pinned:
+        unknown["pinnedProduct"] = _summarize(pinned)
     if unknown:
         meta["unknown_fields"] = unknown
 
@@ -350,9 +404,9 @@ async def on_auth_expired():
     state["auth_expired"] = True
     state["error"] = "Session tokens expired"
     await broadcast("auth_expired", {
-        "message": "Session tokens expired. Open whatnot.com → DevTools → WS → "
-                   "copy fresh _csrf_token, sessionExtensionToken, and Cookie "
-                   "into .env, then restart the server."
+        "message": "Whatnot returned 403 — session tokens look stale. Open any "
+                   "Whatnot livestream once: the extension will push fresh "
+                   "tokens automatically. No restart needed."
     })
     _stop_event.set()
 

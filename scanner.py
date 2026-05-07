@@ -186,10 +186,11 @@ async def scan_stream(stream: dict, on_giveaway, on_auth_expired=None, on_result
                 extra   = {"events_seen": events_seen, "giveaway_events": giveaway_events}
                 print(f"[scanner] {stream_id[:8]}… closed cleanly (likely ended)")
             else:
-                print(f"[scanner] {stream_id[:8]}… closed before join — likely auth/freshness issue")
+                # Whatnot routinely closes idle/transient connections; this is
+                # only an auth signal in combination with a 403 elsewhere.
+                # Don't fire auth_expired from here.
+                print(f"[scanner] {stream_id[:8]}… closed before join (transient)")
                 outcome = "closed_before_join"
-                if on_auth_expired:
-                    await on_auth_expired()
         except websockets.exceptions.ConnectionClosedError as e:
             print(f"[scanner] {stream_id[:8]}… closed with error: {e}")
             outcome = "ws_error"

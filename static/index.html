@@ -571,12 +571,11 @@
       <div class="badge" id="count-badge">0 detected</div>
     </div>
     <div id="auth-banner">
-      <div class="auth-title">⚠ Session tokens expired</div>
+      <div class="auth-title">⚠ Session tokens stale</div>
       <div class="auth-body" id="auth-body">
-        Whatnot rejected the WebSocket with <code>403</code>.
-        Open <code>whatnot.com</code> → DevTools → <code>WS</code> tab → copy the fresh
-        <code>_csrf_token</code> and <code>sessionExtensionToken</code> from the auction socket URL,
-        plus a fresh <code>Cookie</code> from any request, into <code>.env</code>. Then restart the server.
+        Whatnot returned <code>403</code> on the WebSocket. Open any Whatnot
+        livestream in Chrome — the extension will push fresh tokens to this
+        server automatically. No restart needed.
       </div>
     </div>
     <div id="error-banner"></div>
