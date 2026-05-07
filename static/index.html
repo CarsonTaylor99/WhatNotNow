@@ -269,6 +269,14 @@
     to   { opacity: 1; transform: translateY(0); }
   }
 
+  @keyframes slideOut {
+    to { opacity: 0; transform: translateX(20px); max-height: 0; padding-top: 0; padding-bottom: 0; margin: 0; border: 0; }
+  }
+  .giveaway-card.ending {
+    animation: slideOut 0.4s ease forwards;
+    overflow: hidden;
+  }
+
   .giveaway-card:hover { border-color: var(--accent); box-shadow: var(--glow); }
 
   .card-thumb {
@@ -694,6 +702,25 @@
       if (existing) existing.entry_count = entry.entry_count;
     });
 
+    es.addEventListener('giveaway_ended', e => {
+      const { stream_id } = JSON.parse(e.data);
+      const card = document.querySelector(`.giveaway-card[data-id="${stream_id}"]`);
+      if (card) {
+        card.classList.add('ending');
+        setTimeout(() => card.remove(), 420);
+      }
+      giveaways = giveaways.filter(g => g.stream_id !== stream_id);
+      updateStats();
+      updateBadge();
+      if (!giveaways.length && !document.getElementById('empty-state')) {
+        $('giveaway-feed').innerHTML = `
+          <div id="empty-state">
+            <div class="big-icon">🎁</div>
+            <p>No active giveaways right now.<br>Scanning for new ones…</p>
+          </div>`;
+      }
+    });
+
     es.addEventListener('error', e => {
       const { message } = JSON.parse(e.data);
       showError(message);
@@ -810,7 +837,7 @@
     if (entry.outcome === 'joined_ok') {
       const ge = entry.giveaway_events || 0;
       cssClass = ge > 0 ? 'events' : 'joined';
-      label    = ge > 0 ? `${ge} GA` : 'joined';
+      label    = ge > 0 ? 'giveaway' : 'joined';
     } else {
       [cssClass, label] = OUTCOME_LABEL[entry.outcome] || ['error', entry.outcome];
     }

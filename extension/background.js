@@ -4,6 +4,7 @@
 
 const SCANNER_URL = 'http://localhost:5000/auth/refresh';
 const CAPTURE_URL = 'http://localhost:5000/capture/join';
+const AUTO_REFRESH_MINUTES = 25;
 
 async function pushJoin(socketKind, topic, payload) {
   try {
@@ -54,7 +55,11 @@ async function pushTokens(wsUrl, socketKind) {
     if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
 
     const at = Date.now();
-    await chrome.storage.local.set({ lastPushedAt: at, lastWsUrl: wsUrl });
+    // Cache per-socket URL so the auto-refresh alarm can re-push both
+    // auction and live independently with whatever was most recently seen.
+    const update = { lastPushedAt: at, lastWsUrl: wsUrl };
+    update[`lastWsUrl_${socketKind}`] = wsUrl;
+    await chrome.storage.local.set(update);
     flashBadge('OK', '#00aa55');
     return { ok: true, at };
   } catch (e) {
@@ -68,6 +73,36 @@ function flashBadge(text, color) {
   chrome.action.setBadgeBackgroundColor({ color });
   setTimeout(() => chrome.action.setBadgeText({ text: '' }), 2500);
 }
+
+// ── Auto-refresh ──────────────────────────────────────────────────────────
+// Periodically re-push the most recent URL for each socket kind so the
+// scanner stays warm even when no Whatnot tab is open. Cookies are read
+// fresh from chrome.cookies at every tick.
+async function autoRefresh() {
+  const cache = await chrome.storage.local.get(['lastWsUrl_auction', 'lastWsUrl_live']);
+  let pushed = 0;
+  for (const kind of ['auction', 'live']) {
+    const url = cache[`lastWsUrl_${kind}`];
+    if (!url) continue;
+    const r = await pushTokens(url, kind);
+    if (r.ok) pushed++;
+  }
+  if (pushed === 0) {
+    // Nothing cached yet — user hasn't opened a stream since install
+    return;
+  }
+}
+
+// Register a recurring alarm. (chrome.alarms.create overwrites if it exists,
+// so this is safe to call on every service-worker startup.)
+chrome.alarms.create('autoRefresh', {
+  delayInMinutes:  AUTO_REFRESH_MINUTES,
+  periodInMinutes: AUTO_REFRESH_MINUTES,
+});
+
+chrome.alarms.onAlarm.addListener((alarm) => {
+  if (alarm.name === 'autoRefresh') autoRefresh().catch(() => {});
+});
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   (async () => {

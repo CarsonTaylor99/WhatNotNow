@@ -5,7 +5,9 @@ from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fetcher import get_streams
-from scanner import scan_stream
+from scanner import scan_stream, watch_giveaway
+
+DISCOVERY_CONCURRENCY = 4
 from categories import CATEGORIES
 from config import update_auth, AUTH
 
@@ -35,6 +37,17 @@ state = {
 _sse_clients: list[asyncio.Queue] = []
 _stop_event   = asyncio.Event()
 
+# ── Persistent watchers for active giveaways ────────────────────────────────
+# stream_id → asyncio.Task. Each watcher holds a long-running WS connection
+# to that stream's channel and removes the giveaway from state when it ends.
+active_watchers: dict[str, asyncio.Task] = {}
+
+# Sample of first-seen payload per event_name on watcher channels — used to
+# discover what fields Whatnot sends (end-time, audience-restriction, etc.).
+# Bounded so a long-lived process can't leak.
+payload_samples: dict[str, dict] = {}
+PAYLOAD_SAMPLES_MAX = 60
+
 
 # ── SSE broadcast ─────────────────────────────────────────────────────────────
 async def broadcast(event: str, data: dict):
@@ -43,7 +56,58 @@ async def broadcast(event: str, data: dict):
         await q.put(msg)
 
 
-# ── Giveaway callback (called by scanner) ─────────────────────────────────────
+# ── Watcher callbacks ────────────────────────────────────────────────────────
+async def on_watcher_update(stream: dict, payload: dict):
+    """Entry count update from a long-running watcher connection."""
+    sid = stream["id"]
+    existing = next((g for g in state["giveaways"] if g["stream_id"] == sid), None)
+    if not existing:
+        return
+    existing["entry_count"] = payload.get("entryCount", existing["entry_count"])
+    await broadcast("update", existing)
+
+
+async def on_watcher_ended(stream: dict, reason: str):
+    """Giveaway ended (winner announced, stream offline, etc.) — drop the card."""
+    sid = stream["id"]
+    state["giveaways"] = [g for g in state["giveaways"] if g["stream_id"] != sid]
+    active_watchers.pop(sid, None)
+    print(f"[watcher] {sid[:8]}… ended ({reason})")
+    await broadcast("giveaway_ended", {"stream_id": sid, "reason": reason})
+
+
+async def on_watcher_event_seen(stream: dict, event_name: str, payload: dict):
+    """Capture first-seen payload per event_name for field discovery."""
+    if event_name in payload_samples:
+        return
+    if len(payload_samples) >= PAYLOAD_SAMPLES_MAX:
+        return
+    payload_samples[event_name] = {
+        "first_seen_at": int(time.time()),
+        "stream_id":     stream["id"],
+        "username":      stream.get("username", ""),
+        "payload":       payload if isinstance(payload, (dict, list, str, int, float, bool, type(None))) else str(payload),
+    }
+
+
+def _start_watcher(stream: dict) -> None:
+    """Spawn a persistent watcher task for a stream that just got a giveaway."""
+    sid = stream["id"]
+    if sid in active_watchers and not active_watchers[sid].done():
+        return
+    task = asyncio.create_task(
+        watch_giveaway(
+            stream,
+            on_watcher_update,
+            on_watcher_ended,
+            on_event_seen=on_watcher_event_seen,
+        ),
+        name=f"watch:{sid[:8]}",
+    )
+    active_watchers[sid] = task
+
+
+# ── Giveaway callback (called by discovery scanner) ──────────────────────────
 async def on_giveaway(stream: dict, payload: dict):
     stream_id = stream["id"]
 
@@ -64,9 +128,11 @@ async def on_giveaway(stream: dict, payload: dict):
         "entry_count": payload.get("entryCount", 0),
         "product_id":  payload.get("productId", ""),
         "url":         stream.get("url", f"https://www.whatnot.com/live/{stream_id}"),
+        "started_at":  int(time.time()),
     }
     state["giveaways"].append(entry)
     await broadcast("giveaway", entry)
+    _start_watcher(stream)
 
 
 # ── Per-stream scan-result callback (called by scanner) ──────────────────────
@@ -107,8 +173,17 @@ async def on_auth_expired():
 
 
 # ── Main scanner loop ─────────────────────────────────────────────────────────
+async def _cancel_all_watchers():
+    """Cancel and clear every active watcher task. Used on start/stop."""
+    for sid, task in list(active_watchers.items()):
+        if not task.done():
+            task.cancel()
+    active_watchers.clear()
+
+
 async def run_scanner():
     _stop_event.clear()
+    await _cancel_all_watchers()
     state["streams_scanned"] = 0
     state["giveaways"]       = []
     state["error"]           = None
@@ -141,22 +216,33 @@ async def run_scanner():
                     "message": f"Scanning {len(streams)} streams in {cat_name}…"
                 })
 
-                for stream in streams:
+                # Skip streams already covered by a persistent watcher.
+                to_scan = [s for s in streams if s["id"] not in active_watchers]
+                if len(to_scan) < len(streams):
+                    state["streams_scanned"] += (len(streams) - len(to_scan))
+                total_to_scan = len(to_scan)
+
+                # Run discovery scans concurrently, capped by a semaphore.
+                sem = asyncio.Semaphore(DISCOVERY_CONCURRENCY)
+
+                async def scan_one(stream: dict):
                     if _stop_event.is_set():
-                        break
+                        return
+                    async with sem:
+                        if _stop_event.is_set():
+                            return
+                        state["current_stream"] = stream
+                        state["streams_scanned"] += 1
+                        await broadcast("scanning", {
+                            "title":    stream["title"],
+                            "username": stream["username"],
+                            "viewers":  stream["viewers"],
+                            "scanned":  state["streams_scanned"],
+                            "total":    total_to_scan,
+                        })
+                        await scan_stream(stream, on_giveaway, on_auth_expired, on_scan_result)
 
-                    state["current_stream"] = stream
-                    state["streams_scanned"] += 1
-
-                    await broadcast("scanning", {
-                        "title":    stream["title"],
-                        "username": stream["username"],
-                        "viewers":  stream["viewers"],
-                        "scanned":  state["streams_scanned"],
-                        "total":    len(streams),
-                    })
-
-                    await scan_stream(stream, on_giveaway, on_auth_expired, on_scan_result)
+                await asyncio.gather(*(scan_one(s) for s in to_scan))
 
             if not _stop_event.is_set():
                 # Brief pause between full cycles
@@ -228,7 +314,19 @@ async def start_scan(request: Request):
 async def stop_scan():
     _stop_event.set()
     state["scanning"] = False
+    await _cancel_all_watchers()
     return {"ok": True}
+
+
+@app.get("/payload_samples")
+async def get_payload_samples():
+    """First-seen payload per event_name from watcher channels.
+    Use this to discover what fields Whatnot actually sends (end-time,
+    audience, productId metadata, etc.) so we can wire them into the UI."""
+    return {
+        "count": len(payload_samples),
+        "samples": payload_samples,
+    }
 
 
 def _trunc(s: str, n: int = 12) -> str:

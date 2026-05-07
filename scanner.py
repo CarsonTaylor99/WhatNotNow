@@ -60,6 +60,19 @@ async def _heartbeat(ws, stop_event: asyncio.Event):
             break
 
 
+# Event names that signal a giveaway has finished. We don't have a confirmed
+# list from Whatnot — these are the most likely candidates. on_event_seen
+# captures samples so we can refine this list from real data (Phase 2).
+GIVEAWAY_END_EVENTS = {
+    "giveaway_ended",
+    "giveaway_finished",
+    "giveaway_winner",
+    "giveaway_winner_announced",
+    "giveaway_completed",
+    "giveaway_closed",
+}
+
+
 async def scan_stream(stream: dict, on_giveaway, on_auth_expired=None, on_result=None) -> None:
     """
     Connect to the live socket, join auction:{stream_uuid}, and listen for
@@ -138,6 +151,9 @@ async def scan_stream(stream: dict, on_giveaway, on_auth_expired=None, on_result
                         if event == "giveaway_entry_count_updated":
                             giveaway_events += 1
                             await on_giveaway(stream, payload)
+                            # Hand off to the persistent watcher; don't keep
+                            # this discovery WS competing for the same channel.
+                            break
 
                 finally:
                     stop_event.set()
@@ -191,3 +207,106 @@ async def scan_stream(stream: dict, on_giveaway, on_auth_expired=None, on_result
             "outcome":   outcome,
             **extra,
         })
+
+
+async def watch_giveaway(
+    stream: dict,
+    on_update,           # async (stream, payload) — entry-count updates
+    on_ended,            # async (stream, reason)  — giveaway done / stream offline
+    on_event_seen=None,  # async (stream, event_name, payload) — for sample capture
+    stop_event: asyncio.Event | None = None,
+    max_seconds: int = 30 * 60,
+) -> None:
+    """Hold a long-running connection to a stream that has an active giveaway.
+
+    Forwards entry-count updates and detects end-of-giveaway via known event
+    names, ws close, or max_seconds timeout. on_event_seen, if provided, fires
+    for *every* channel event — used by main.py to capture payload samples
+    so we can learn which fields Whatnot actually sends.
+    """
+    stream_id = stream["id"]
+    topic     = f"auction:{stream_id}"
+
+    if not AUTH.get("livestream_session_id"):
+        await on_ended(stream, "no_session_id")
+        return
+
+    url = _build_ws_url()
+    ref = 0
+    def next_ref():
+        nonlocal ref
+        ref += 1
+        return str(ref)
+
+    join_accepted = False
+
+    try:
+        async with websockets.connect(
+            url,
+            ping_interval=None,
+            open_timeout=8,
+            close_timeout=5,
+            additional_headers=_browser_headers(),
+        ) as ws:
+            await ws.send(json.dumps([next_ref(), next_ref(), topic, "phx_join", _join_payload()]))
+
+            hb_stop = asyncio.Event()
+            hb_task = asyncio.create_task(_heartbeat(ws, hb_stop))
+
+            try:
+                deadline = asyncio.get_event_loop().time() + max_seconds
+                while asyncio.get_event_loop().time() < deadline:
+                    if stop_event and stop_event.is_set():
+                        await on_ended(stream, "stopped")
+                        return
+
+                    remaining = deadline - asyncio.get_event_loop().time()
+                    try:
+                        raw = await asyncio.wait_for(ws.recv(), timeout=min(remaining, 20))
+                    except asyncio.TimeoutError:
+                        continue
+
+                    try:
+                        msg = json.loads(raw)
+                    except json.JSONDecodeError:
+                        continue
+                    if not isinstance(msg, list) or len(msg) < 5:
+                        continue
+
+                    event   = msg[3]
+                    payload = msg[4]
+
+                    if event == "phx_reply" and isinstance(payload, dict):
+                        if payload.get("status") == "ok":
+                            join_accepted = True
+                        elif payload.get("status") == "error":
+                            await on_ended(stream, f"join_rejected: {payload.get('response')}")
+                            return
+
+                    if on_event_seen:
+                        try:
+                            await on_event_seen(stream, event, payload)
+                        except Exception:
+                            pass
+
+                    if event == "giveaway_entry_count_updated":
+                        await on_update(stream, payload)
+                    elif event in GIVEAWAY_END_EVENTS:
+                        await on_ended(stream, event)
+                        return
+
+                # Hit max_seconds without an explicit end event
+                await on_ended(stream, "max_watch_reached")
+
+            finally:
+                hb_stop.set()
+                hb_task.cancel()
+
+    except websockets.exceptions.ConnectionClosedOK:
+        await on_ended(stream, "stream_offline" if join_accepted else "closed_before_join")
+    except websockets.exceptions.ConnectionClosedError as e:
+        await on_ended(stream, f"ws_closed_error: {e}")
+    except websockets.exceptions.InvalidStatus as e:
+        await on_ended(stream, "ws_403" if "403" in str(e) else f"ws_error: {e}")
+    except Exception as e:
+        await on_ended(stream, f"error: {e}")
