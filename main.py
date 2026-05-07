@@ -219,17 +219,59 @@ async def on_watcher_ended(stream: dict, reason: str):
 
 
 async def on_watcher_event_seen(stream: dict, event_name: str, payload: dict):
-    """Capture first-seen payload per event_name for field discovery."""
-    if event_name in payload_samples:
+    """Capture first-seen payload per event_name for field discovery, AND
+    surface channel-event names + payload keys onto the giveaway card so
+    real Whatnot field/event names become visible without spelunking
+    /payload_samples manually."""
+    # Buffered sample (first-seen per name)
+    if event_name not in payload_samples and len(payload_samples) < PAYLOAD_SAMPLES_MAX:
+        payload_samples[event_name] = {
+            "first_seen_at": int(time.time()),
+            "stream_id":     stream["id"],
+            "username":      stream.get("username", ""),
+            "payload":       payload if isinstance(payload, (dict, list, str, int, float, bool, type(None))) else str(payload),
+        }
+
+    # Live update on the card if it's still around
+    sid = stream["id"]
+    entry = next((g for g in state["giveaways"] if g["stream_id"] == sid), None)
+    if not entry:
         return
-    if len(payload_samples) >= PAYLOAD_SAMPLES_MAX:
-        return
-    payload_samples[event_name] = {
-        "first_seen_at": int(time.time()),
-        "stream_id":     stream["id"],
-        "username":      stream.get("username", ""),
-        "payload":       payload if isinstance(payload, (dict, list, str, int, float, bool, type(None))) else str(payload),
-    }
+
+    dirty = False
+    events_set = set(entry.get("channel_events") or [])
+    if event_name not in events_set:
+        events_set.add(event_name)
+        entry["channel_events"] = sorted(events_set)
+        dirty = True
+
+    if isinstance(payload, dict):
+        keys_set = set(entry.get("payload_keys") or [])
+        for k in payload.keys():
+            if k not in keys_set:
+                keys_set.add(k)
+                dirty = True
+        if dirty:
+            entry["payload_keys"] = sorted(keys_set)
+
+        # Metadata may arrive on non-entry-count events (e.g., a giveaway_started
+        # event carrying endsAt + productName). Re-extract from every payload
+        # and merge anything new.
+        meta = _extract_giveaway_meta(payload)
+        for k, v in meta.items():
+            if k == "unknown_fields":
+                # Merge unmapped keys cumulatively across events
+                cur = dict(entry.get("unknown_fields") or {})
+                cur.update(v)
+                if cur != entry.get("unknown_fields"):
+                    entry["unknown_fields"] = cur
+                    dirty = True
+            elif entry.get(k) != v:
+                entry[k] = v
+                dirty = True
+
+    if dirty:
+        await broadcast("update", entry)
 
 
 def _start_watcher(stream: dict) -> None:

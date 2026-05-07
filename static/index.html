@@ -325,6 +325,24 @@
     background: var(--accent2);
     animation: pulse 1.2s ease-in-out infinite;
   }
+  .elapsed-pill {
+    font-family: 'Space Mono', monospace;
+    font-size: 0.7rem;
+    padding: 2px 8px; border-radius: 4px;
+    color: var(--muted);
+    border: 1px solid var(--border);
+  }
+  .channel-diag {
+    font-family: 'Space Mono', monospace;
+    font-size: 0.6rem; color: var(--muted);
+    margin-top: 4px; line-height: 1.4;
+    word-break: break-all;
+  }
+  .channel-diag .lbl {
+    color: var(--accent); opacity: 0.8;
+    text-transform: uppercase; letter-spacing: 0.06em;
+    margin-right: 4px; font-size: 0.56rem;
+  }
   .audience-pill {
     font-size: 0.65rem; padding: 2px 8px; border-radius: 4px;
     color: var(--accent); border: 1px solid var(--accent);
@@ -751,6 +769,7 @@
     es.addEventListener('giveaway_ended', e => {
       const { stream_id } = JSON.parse(e.data);
       stopCardTimer(stream_id);
+      stopElapsedTicker(stream_id);
       const card = document.querySelector(`.giveaway-card[data-id="${stream_id}"]`);
       if (card) {
         card.classList.add('ending');
@@ -783,6 +802,8 @@
   // ── Giveaway card ─────────────────────────────────────────────────────────
   // stream_id → setInterval handle for the countdown timer
   const cardTimers = new Map();
+  // stream_id → setInterval handle for the elapsed ticker
+  const cardElapsed = new Map();
 
   function fmtRemaining(secs) {
     if (secs < 0) secs = 0;
@@ -816,12 +837,34 @@
     if (id) { clearInterval(id); cardTimers.delete(streamId); }
   }
 
+  function startElapsedTicker(streamId, startedAtSec) {
+    stopElapsedTicker(streamId);
+    const tick = () => {
+      const card = document.querySelector(`.giveaway-card[data-id="${streamId}"]`);
+      if (!card) { stopElapsedTicker(streamId); return; }
+      const el = card.querySelector('.elapsed-pill');
+      if (!el) return;
+      const elapsed = Math.max(0, Math.floor(Date.now() / 1000) - startedAtSec);
+      el.textContent = '+' + fmtRemaining(elapsed);
+    };
+    tick();
+    cardElapsed.set(streamId, setInterval(tick, 1000));
+  }
+
+  function stopElapsedTicker(streamId) {
+    const id = cardElapsed.get(streamId);
+    if (id) { clearInterval(id); cardElapsed.delete(streamId); }
+  }
+
   function renderCardBody(entry) {
     const audience = entry.audience
       ? `<span class="audience-pill">👤 ${escHtml(entry.audience)}</span>`
       : '';
     const timer = (typeof entry.ends_at === 'number')
       ? `<span class="timer-pill">⏱ —</span>`
+      : '';
+    const elapsed = (typeof entry.started_at === 'number')
+      ? `<span class="elapsed-pill" title="time since detected">+0:00</span>`
       : '';
     const product = entry.product_name
       ? `<div class="product-line">📦 ${escHtml(entry.product_name)}</div>`
@@ -833,17 +876,28 @@
             .join(' · ')
         }</div>`
       : '';
+    const channel = (
+      (entry.channel_events && entry.channel_events.length) ||
+      (entry.payload_keys && entry.payload_keys.length)
+    ) ? `<div class="channel-diag">
+          ${entry.channel_events && entry.channel_events.length
+            ? `<span class="lbl">events:</span>${entry.channel_events.map(escHtml).join(' · ')}` : ''}
+          ${entry.payload_keys && entry.payload_keys.length
+            ? `<br><span class="lbl">keys:</span>${entry.payload_keys.map(escHtml).join(' · ')}` : ''}
+        </div>` : '';
     return `
       <div class="card-title">${escHtml(entry.title)}</div>
       <div class="card-seller">@${escHtml(entry.username)}</div>
       <div class="card-meta">
         <span class="entry-count">${entry.entry_count} entries</span>
         ${entry.category ? `<span class="cat-pill">${escHtml(entry.category)}</span>` : ''}
+        ${elapsed}
         ${timer}
         ${audience}
       </div>
       ${product}
       ${unknown}
+      ${channel}
     `;
   }
 
@@ -871,6 +925,7 @@
 
     feed.insertBefore(card, feed.firstChild);
     if (typeof entry.ends_at === 'number') startCardTimer(entry.stream_id, entry.ends_at);
+    if (typeof entry.started_at === 'number') startElapsedTicker(entry.stream_id, entry.started_at);
   }
 
   function refreshCardBody(entry) {
@@ -882,6 +937,9 @@
       startCardTimer(entry.stream_id, entry.ends_at);
     } else {
       stopCardTimer(entry.stream_id);
+    }
+    if (typeof entry.started_at === 'number') {
+      startElapsedTicker(entry.stream_id, entry.started_at);
     }
   }
 

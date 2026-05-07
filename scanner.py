@@ -209,16 +209,20 @@ async def scan_stream(stream: dict, on_giveaway, on_auth_expired=None, on_result
         })
 
 
+IDLE_TIMEOUT = 90  # sec without an entry-count update → giveaway considered over
+
+
 async def _watch_attempt(
     stream: dict,
     on_update,
     on_event_seen,
     stop_event: asyncio.Event | None,
     deadline: float,
+    idle_timeout: int = IDLE_TIMEOUT,
 ) -> tuple[str, str | None]:
     """One connect+listen attempt. Returns (status, reason).
     status:
-      "explicit_end"  — saw a known end event (terminal)
+      "explicit_end"  — saw a known end event OR idle-timed-out (terminal)
       "max_watch"     — deadline reached (terminal)
       "stopped"       — stop_event set (terminal)
       "join_rejected" — Phoenix rejected the join (terminal)
@@ -236,6 +240,7 @@ async def _watch_attempt(
         return str(ref)
 
     join_accepted = False
+    last_update_at = asyncio.get_event_loop().time()  # idle timer reference
 
     try:
         async with websockets.connect(
@@ -255,9 +260,15 @@ async def _watch_attempt(
                     if stop_event and stop_event.is_set():
                         return ("stopped", None)
 
+                    # Idle-timeout: if no entry update in N sec, giveaway is
+                    # almost certainly over — Whatnot tends to just stop firing
+                    # entry events rather than send an explicit ended event.
+                    if asyncio.get_event_loop().time() - last_update_at > idle_timeout:
+                        return ("explicit_end", "idle_timeout")
+
                     remaining = deadline - asyncio.get_event_loop().time()
                     try:
-                        raw = await asyncio.wait_for(ws.recv(), timeout=min(remaining, 20))
+                        raw = await asyncio.wait_for(ws.recv(), timeout=min(remaining, 10))
                     except asyncio.TimeoutError:
                         continue
 
@@ -284,6 +295,7 @@ async def _watch_attempt(
                             pass
 
                     if event == "giveaway_entry_count_updated":
+                        last_update_at = asyncio.get_event_loop().time()
                         await on_update(stream, payload)
                     elif event in GIVEAWAY_END_EVENTS:
                         return ("explicit_end", event)
