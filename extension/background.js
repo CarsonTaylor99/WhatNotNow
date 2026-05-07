@@ -5,7 +5,12 @@
 const SCANNER_URL    = 'http://localhost:5000/auth/refresh';
 const CAPTURE_URL    = 'http://localhost:5000/capture/join';
 const CATEGORIES_URL = 'http://localhost:5000/categories/discovered';
-const AUTO_REFRESH_MINUTES = 25;
+// Whatnot's session-extension tokens appear to have a ~5min TTL. Refresh
+// before that hits. We can only push the most-recent captured URL params
+// — those don't update unless the page itself opens a new WebSocket
+// (e.g., user clicks into a stream). The cookie does refresh on its own
+// from chrome.cookies.getAll, so this still helps the cookie-stale case.
+const AUTO_REFRESH_MINUTES = 4;
 
 // In-memory dedup so we don't POST the same (id,label) on every page nav.
 // Persisted across SW restarts via chrome.storage.local.
