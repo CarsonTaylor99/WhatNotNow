@@ -1,9 +1,16 @@
 // Runs in the page's MAIN world. Monkey-patches WebSocket so we can capture:
 //   1. the socket URL (csrf_token, sessionExtensionToken, client_version)
 //   2. every outgoing phx_join (topic + payload)
+//   3. references to active Whatnot sockets — so we can force-close them
+//      on demand, triggering Phoenix's auto-reconnect with fresh tokens.
 (() => {
   const Orig = window.WebSocket;
   if (!Orig || Orig.__wn_patched) return;
+
+  // Track currently-open Whatnot WebSockets so the extension can ask us
+  // to close+reconnect them when its auto-refresh alarm fires.
+  const activeSockets = new Set();
+  window.__wn_sockets = activeSockets;
 
   const Patched = function (url, protocols) {
     const isWhatnot = typeof url === 'string' &&
@@ -20,6 +27,9 @@
     const ws = protocols !== undefined ? new Orig(url, protocols) : new Orig(url);
 
     if (isWhatnot) {
+      activeSockets.add(ws);
+      ws.addEventListener('close', () => activeSockets.delete(ws));
+
       const origSend = ws.send.bind(ws);
       ws.send = function (data) {
         try {
@@ -49,6 +59,26 @@
   Patched.__wn_patched = true;
 
   window.WebSocket = Patched;
+
+  // Force-reconnect handler: close every active Whatnot WS. Phoenix's
+  // built-in client will auto-reconnect within ~1s, which mints a fresh
+  // URL with new csrf+session tokens — captured by the constructor patch
+  // above and pushed to the scanner via content.js → background.js.
+  window.addEventListener('message', (e) => {
+    if (e.source !== window || !e.data) return;
+    if (e.data.type !== 'WHATNOT_FORCE_RECONNECT') return;
+    let closed = 0;
+    for (const ws of Array.from(activeSockets)) {
+      try {
+        if (ws.readyState === Orig.OPEN || ws.readyState === Orig.CONNECTING) {
+          ws.close(1000, 'wnn_refresh');
+          closed++;
+        }
+      } catch (_) {}
+    }
+    // ack so background.js can log / verify
+    try { window.postMessage({ type: 'WHATNOT_RECONNECT_DONE', closed }, '*'); } catch (_) {}
+  });
 })();
 
 

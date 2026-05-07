@@ -115,6 +115,28 @@ function flashBadge(text, color) {
 // scanner stays warm even when no Whatnot tab is open. Cookies are read
 // fresh from chrome.cookies at every tick.
 async function autoRefresh() {
+  // Step 1: ask any open Whatnot tab to drop its WebSocket. The page's
+  // Phoenix client will auto-reconnect within ~1s, mint a fresh URL with
+  // new csrf+session tokens, and our WebSocket constructor patch catches
+  // them. This is what makes refresh actually autonomous — without it
+  // we'd just be re-pushing the same stale URL params with a fresh cookie.
+  let triggered = 0;
+  try {
+    const tabs = await chrome.tabs.query({ url: ['*://*.whatnot.com/*'] });
+    for (const t of tabs) {
+      try {
+        await chrome.tabs.sendMessage(t.id, { type: 'force_reconnect' });
+        triggered++;
+      } catch (_) {
+        // Tab may not have the content script loaded yet (e.g., chrome:// page)
+      }
+    }
+  } catch (_) {}
+
+  // Step 2: re-push the most recent captured URL for both socket kinds.
+  // Cookies are read fresh from chrome.cookies. If step 1 succeeded a
+  // moment ago, the inject.js will have just pushed the *new* URL ahead
+  // of us — this push is the cookie-only fallback for the no-tab case.
   const cache = await chrome.storage.local.get(['lastWsUrl_auction', 'lastWsUrl_live']);
   let pushed = 0;
   for (const kind of ['auction', 'live']) {
@@ -123,10 +145,7 @@ async function autoRefresh() {
     const r = await pushTokens(url, kind);
     if (r.ok) pushed++;
   }
-  if (pushed === 0) {
-    // Nothing cached yet — user hasn't opened a stream since install
-    return;
-  }
+  console.log(`[wnn auto-refresh] reconnects triggered: ${triggered}, cookie pushes: ${pushed}`);
 }
 
 // Register a recurring alarm. (chrome.alarms.create overwrites if it exists,
