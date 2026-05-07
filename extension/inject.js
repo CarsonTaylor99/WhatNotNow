@@ -50,3 +50,70 @@
 
   window.WebSocket = Patched;
 })();
+
+
+// ── fetch monkey-patch for category discovery ────────────────────────────
+// When whatnot.com makes LiveStreamExplore GraphQL calls, capture
+// (variables.id → category label) pairs from the request + response so the
+// scanner can offer them as checkable categories without DevTools work.
+(() => {
+  const origFetch = window.fetch;
+  if (!origFetch || origFetch.__wn_patched) return;
+
+  const wrapped = async function (input, init) {
+    const url = typeof input === 'string' ? input : (input && input.url) || '';
+    const isGql = typeof url === 'string' && url.includes('/services/graphql/');
+    if (!isGql) return origFetch.apply(this, arguments);
+
+    // Pull operationName + variables.id from the request body
+    let opName = null, varId = null;
+    try {
+      const body = (init && init.body) || (input && input.body) || null;
+      if (typeof body === 'string') {
+        const parsed = JSON.parse(body);
+        opName = parsed.operationName || null;
+        varId  = parsed.variables && parsed.variables.id ? String(parsed.variables.id) : null;
+      }
+    } catch (_) {}
+
+    const resp = await origFetch.apply(this, arguments);
+
+    // Only inspect bodies for the queries we care about
+    if (opName !== 'LiveStreamExplore' || !varId) return resp;
+
+    try {
+      const cloned = resp.clone();
+      cloned.json().then((data) => {
+        // Walk the LiveStreamExplore response: pick the most common label
+        // from the streams' livestreamCategories[0].label
+        const edges =
+          (((data || {}).data || {}).liveStream || {}).explore &&
+          ((((data || {}).data || {}).liveStream || {}).explore.objects || {}).edges;
+        if (!Array.isArray(edges) || !edges.length) return;
+        const counts = {};
+        for (const e of edges) {
+          const obj = e && e.node && e.node.object;
+          if (!obj) continue;
+          const cats = obj.livestreamCategories || [];
+          for (const c of cats) {
+            const lbl = c && c.label;
+            if (typeof lbl === 'string' && lbl.length > 0 && lbl.length < 100) {
+              counts[lbl] = (counts[lbl] || 0) + 1;
+            }
+          }
+        }
+        const top = Object.entries(counts).sort((a, b) => b[1] - a[1])[0];
+        if (!top) return;
+        window.postMessage({
+          type:  'WHATNOT_CATEGORY',
+          id:    varId,
+          label: top[0],
+        }, '*');
+      }).catch(() => {});
+    } catch (_) {}
+
+    return resp;
+  };
+  wrapped.__wn_patched = true;
+  window.fetch = wrapped;
+})();

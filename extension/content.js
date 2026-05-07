@@ -21,4 +21,12 @@ window.addEventListener('message', (event) => {
       payload: data.payload,
     }, () => { void chrome.runtime.lastError; });
   }
+
+  if (data.type === 'WHATNOT_CATEGORY') {
+    chrome.runtime.sendMessage({
+      type:  'category',
+      id:    data.id,
+      label: data.label,
+    }, () => { void chrome.runtime.lastError; });
+  }
 });

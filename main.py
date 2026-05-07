@@ -272,7 +272,45 @@ async def get_state():
 
 @app.get("/categories")
 async def get_categories():
-    return list(CATEGORIES.keys())
+    return sorted(CATEGORIES.keys())
+
+
+_UUID_RE = __import__("re").compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+)
+
+
+@app.post("/categories/discovered")
+async def categories_discovered(request: Request):
+    """Merge discovered (id, label) pairs from the extension into the runtime
+    category registry. In-memory only — not persisted to categories.py."""
+    body = await request.json()
+    items = body.get("categories") or []
+    added = []
+
+    # Reverse lookup so we don't re-add an id under a different label
+    known_ids = set(CATEGORIES.values())
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        cid   = (item.get("id")    or "").strip().lower()
+        label = (item.get("label") or "").strip()
+        if not _UUID_RE.match(cid) or not label or len(label) > 100:
+            continue
+        if cid in known_ids or label in CATEGORIES:
+            continue
+        CATEGORIES[label] = cid
+        known_ids.add(cid)
+        added.append({"label": label, "id": cid})
+
+    if added:
+        print(f"[categories] discovered {len(added)}: {[a['label'] for a in added]}")
+        await broadcast("categories_updated", {
+            "added":   added,
+            "all":     sorted(CATEGORIES.keys()),
+        })
+
+    return {"ok": True, "added": added, "total": len(CATEGORIES)}
 
 
 @app.get("/events")

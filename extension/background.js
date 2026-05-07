@@ -2,9 +2,40 @@
 // Whatnot cookie via chrome.cookies (incl. HttpOnly), and POSTs to the local
 // scanner's /auth/refresh endpoint.
 
-const SCANNER_URL = 'http://localhost:5000/auth/refresh';
-const CAPTURE_URL = 'http://localhost:5000/capture/join';
+const SCANNER_URL    = 'http://localhost:5000/auth/refresh';
+const CAPTURE_URL    = 'http://localhost:5000/capture/join';
+const CATEGORIES_URL = 'http://localhost:5000/categories/discovered';
 const AUTO_REFRESH_MINUTES = 25;
+
+// In-memory dedup so we don't POST the same (id,label) on every page nav.
+// Persisted across SW restarts via chrome.storage.local.
+const discoveredCats = new Map();
+chrome.storage.local.get('discoveredCats').then(({ discoveredCats: stored }) => {
+  if (stored && typeof stored === 'object') {
+    for (const [k, v] of Object.entries(stored)) discoveredCats.set(k, v);
+  }
+}).catch(() => {});
+
+async function pushCategory(id, label) {
+  if (!id || !label) return;
+  const key = `${id}::${label}`;
+  if (discoveredCats.has(key)) return;
+  discoveredCats.set(key, Date.now());
+  // Persist
+  try {
+    await chrome.storage.local.set({
+      discoveredCats: Object.fromEntries(discoveredCats),
+    });
+  } catch (_) {}
+
+  try {
+    await fetch(CATEGORIES_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ categories: [{ id, label }] }),
+    });
+  } catch (_) { /* server may not be running */ }
+}
 
 async function pushJoin(socketKind, topic, payload) {
   try {
@@ -113,6 +144,11 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     }
     if (msg.type === 'phx_join') {
       await pushJoin(msg.socketKind, msg.topic, msg.payload);
+      sendResponse({ ok: true });
+      return;
+    }
+    if (msg.type === 'category') {
+      await pushCategory(msg.id, msg.label);
       sendResponse({ ok: true });
       return;
     }

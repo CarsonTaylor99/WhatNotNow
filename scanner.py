@@ -209,30 +209,27 @@ async def scan_stream(stream: dict, on_giveaway, on_auth_expired=None, on_result
         })
 
 
-async def watch_giveaway(
+async def _watch_attempt(
     stream: dict,
-    on_update,           # async (stream, payload) — entry-count updates
-    on_ended,            # async (stream, reason)  — giveaway done / stream offline
-    on_event_seen=None,  # async (stream, event_name, payload) — for sample capture
-    stop_event: asyncio.Event | None = None,
-    max_seconds: int = 30 * 60,
-) -> None:
-    """Hold a long-running connection to a stream that has an active giveaway.
-
-    Forwards entry-count updates and detects end-of-giveaway via known event
-    names, ws close, or max_seconds timeout. on_event_seen, if provided, fires
-    for *every* channel event — used by main.py to capture payload samples
-    so we can learn which fields Whatnot actually sends.
+    on_update,
+    on_event_seen,
+    stop_event: asyncio.Event | None,
+    deadline: float,
+) -> tuple[str, str | None]:
+    """One connect+listen attempt. Returns (status, reason).
+    status:
+      "explicit_end"  — saw a known end event (terminal)
+      "max_watch"     — deadline reached (terminal)
+      "stopped"       — stop_event set (terminal)
+      "join_rejected" — Phoenix rejected the join (terminal)
+      "auth_403"      — WS upgrade 403 (terminal)
+      "transient"     — WS closed without a definitive signal (retryable)
+      "fatal"         — non-recoverable exception (terminal)
     """
     stream_id = stream["id"]
     topic     = f"auction:{stream_id}"
-
-    if not AUTH.get("livestream_session_id"):
-        await on_ended(stream, "no_session_id")
-        return
-
-    url = _build_ws_url()
-    ref = 0
+    url       = _build_ws_url()
+    ref       = 0
     def next_ref():
         nonlocal ref
         ref += 1
@@ -254,11 +251,9 @@ async def watch_giveaway(
             hb_task = asyncio.create_task(_heartbeat(ws, hb_stop))
 
             try:
-                deadline = asyncio.get_event_loop().time() + max_seconds
                 while asyncio.get_event_loop().time() < deadline:
                     if stop_event and stop_event.is_set():
-                        await on_ended(stream, "stopped")
-                        return
+                        return ("stopped", None)
 
                     remaining = deadline - asyncio.get_event_loop().time()
                     try:
@@ -280,8 +275,7 @@ async def watch_giveaway(
                         if payload.get("status") == "ok":
                             join_accepted = True
                         elif payload.get("status") == "error":
-                            await on_ended(stream, f"join_rejected: {payload.get('response')}")
-                            return
+                            return ("join_rejected", str(payload.get("response")))
 
                     if on_event_seen:
                         try:
@@ -292,21 +286,104 @@ async def watch_giveaway(
                     if event == "giveaway_entry_count_updated":
                         await on_update(stream, payload)
                     elif event in GIVEAWAY_END_EVENTS:
-                        await on_ended(stream, event)
-                        return
+                        return ("explicit_end", event)
 
-                # Hit max_seconds without an explicit end event
-                await on_ended(stream, "max_watch_reached")
+                return ("max_watch", None)
 
             finally:
                 hb_stop.set()
                 hb_task.cancel()
 
     except websockets.exceptions.ConnectionClosedOK:
-        await on_ended(stream, "stream_offline" if join_accepted else "closed_before_join")
+        # Could be the stream truly ending OR Whatnot rebalancing/idle-pruning
+        # our connection. Without an explicit end event we treat as transient
+        # and let the outer loop decide whether to retry.
+        return ("transient", "closed_ok")
     except websockets.exceptions.ConnectionClosedError as e:
-        await on_ended(stream, f"ws_closed_error: {e}")
+        return ("transient", f"closed_error: {e}")
     except websockets.exceptions.InvalidStatus as e:
-        await on_ended(stream, "ws_403" if "403" in str(e) else f"ws_error: {e}")
+        if "403" in str(e):
+            return ("auth_403", str(e))
+        return ("transient", f"ws_error: {e}")
+    except (asyncio.CancelledError, KeyboardInterrupt):
+        raise
     except Exception as e:
-        await on_ended(stream, f"error: {e}")
+        return ("fatal", f"unexpected: {e}")
+    finally:
+        # If we never got the join ack and an exception was bubbling, the
+        # outer loop sees status="transient" and gets to decide on retry.
+        _ = join_accepted  # noqa: F841 — kept for readability/debugging
+
+
+async def watch_giveaway(
+    stream: dict,
+    on_update,           # async (stream, payload) — entry-count updates
+    on_ended,            # async (stream, reason)  — giveaway done / stream offline
+    on_event_seen=None,  # async (stream, event_name, payload) — for sample capture
+    stop_event: asyncio.Event | None = None,
+    max_seconds: int = 30 * 60,
+    max_reconnects: int = 4,
+    backoff_base: float = 2.0,
+) -> None:
+    """Hold a long-running connection to a stream that has an active giveaway.
+
+    Auto-reconnects on transient WS closes — Whatnot frequently drops idle
+    or rebalanced connections, so a single ConnectionClosedOK doesn't mean
+    the stream actually ended. Only emits on_ended for terminal conditions:
+    an explicit end event, max_seconds, stop_event, hard auth failure, or
+    max_reconnects exhausted without a successful follow-up join.
+    """
+    stream_id = stream["id"]
+
+    if not AUTH.get("livestream_session_id"):
+        await on_ended(stream, "no_session_id")
+        return
+
+    deadline       = asyncio.get_event_loop().time() + max_seconds
+    consec_fails   = 0  # transient closes in a row without a productive run
+
+    while True:
+        if stop_event and stop_event.is_set():
+            await on_ended(stream, "stopped")
+            return
+        if asyncio.get_event_loop().time() >= deadline:
+            await on_ended(stream, "max_watch_reached")
+            return
+
+        status, reason = await _watch_attempt(
+            stream, on_update, on_event_seen, stop_event, deadline,
+        )
+
+        if status == "explicit_end":
+            await on_ended(stream, reason or "ended")
+            return
+        if status == "max_watch":
+            await on_ended(stream, "max_watch_reached")
+            return
+        if status == "stopped":
+            await on_ended(stream, "stopped")
+            return
+        if status == "join_rejected":
+            await on_ended(stream, f"join_rejected: {reason}")
+            return
+        if status == "auth_403":
+            await on_ended(stream, "ws_403")
+            return
+        if status == "fatal":
+            await on_ended(stream, reason or "fatal")
+            return
+
+        # transient — try to reconnect with backoff
+        consec_fails += 1
+        if consec_fails > max_reconnects:
+            await on_ended(stream, f"reconnect_exhausted ({reason})")
+            return
+
+        sleep_for = min(backoff_base ** consec_fails, 30)
+        print(f"[watcher] {stream_id[:8]}… transient close ({reason}); "
+              f"reconnect {consec_fails}/{max_reconnects} in {sleep_for:.1f}s")
+        try:
+            await asyncio.sleep(sleep_for)
+        except asyncio.CancelledError:
+            await on_ended(stream, "stopped")
+            return

@@ -702,6 +702,17 @@
       if (existing) existing.entry_count = entry.entry_count;
     });
 
+    es.addEventListener('categories_updated', e => {
+      const { all } = JSON.parse(e.data);
+      // Only add genuinely new categories — keep existing selections intact
+      const before = new Set(categories);
+      categories = all;
+      for (const c of all) {
+        if (!before.has(c)) selected.add(c);  // newly discovered → on by default
+      }
+      renderCategories();
+    });
+
     es.addEventListener('giveaway_ended', e => {
       const { stream_id } = JSON.parse(e.data);
       const card = document.querySelector(`.giveaway-card[data-id="${stream_id}"]`);
