@@ -1,7 +1,15 @@
 @echo off
 setlocal
-cd /d "%~dp0"
 title Whatnot Scanner — Setup
+
+REM pushd handles UNC paths (\\wsl.localhost\...) by mapping to a temp
+REM drive; plain `cd /d` would silently fail and land in C:\Windows.
+pushd "%~dp0" 2>nul
+if errorlevel 1 (
+    echo ERROR: Could not enter script folder.
+    pause
+    exit /b 1
+)
 
 echo.
 echo === Whatnot Scanner — Setup ===
