@@ -368,6 +368,30 @@
     margin-right: 4px; font-size: 0.58rem;
   }
 
+  /* Collapsible per-card debug block — hides unmapped/events/keys
+     unless the user opens it. */
+  .card-debug {
+    margin-top: 6px;
+    grid-column: 1 / -1;
+  }
+  .card-debug summary {
+    list-style: none;
+    cursor: pointer;
+    font-family: 'Space Mono', monospace;
+    font-size: 0.6rem;
+    color: var(--muted);
+    opacity: 0.5;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    user-select: none;
+    padding: 2px 0;
+  }
+  .card-debug summary:hover { opacity: 0.85; }
+  .card-debug summary::-webkit-details-marker { display: none; }
+  .card-debug[open] summary { opacity: 0.85; }
+  .card-debug summary::before { content: '▸ '; }
+  .card-debug[open] summary::before { content: '▾ '; }
+
   .card-actions { display: flex; flex-direction: column; gap: 6px; }
   .join-btn {
     font-family: 'Syne', sans-serif;
@@ -884,6 +908,9 @@
           ${entry.payload_keys && entry.payload_keys.length
             ? `<br><span class="lbl">keys:</span>${entry.payload_keys.map(escHtml).join(' · ')}` : ''}
         </div>` : '';
+    const debug = (unknown || channel)
+      ? `<details class="card-debug"><summary>debug</summary>${unknown}${channel}</details>`
+      : '';
     return `
       <div class="card-title">${escHtml(entry.title)}</div>
       <div class="card-seller">@${escHtml(entry.username)}</div>
@@ -895,8 +922,7 @@
         ${audience}
       </div>
       ${product}
-      ${unknown}
-      ${channel}
+      ${debug}
     `;
   }
 
