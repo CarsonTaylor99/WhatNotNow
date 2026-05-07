@@ -7,10 +7,25 @@
   const Orig = window.WebSocket;
   if (!Orig || Orig.__wn_patched) return;
 
+  function extractTokens(u) {
+    try {
+      const url = new URL(u);
+      return (
+        url.searchParams.get('_csrf_token') + '|' +
+        url.searchParams.get('sessionExtensionToken')
+      );
+    } catch (_) { return ''; }
+  }
+
   // Track currently-open Whatnot WebSockets so the extension can ask us
   // to close+reconnect them when its auto-refresh alarm fires.
   const activeSockets = new Set();
   window.__wn_sockets = activeSockets;
+
+  // Remember the most recent URL we've seen per socket kind so we can detect
+  // whether Phoenix is actually getting fresh tokens on reconnect or just
+  // re-using stale ones. Tells us whether close-and-reconnect is sufficient.
+  const lastUrlByKind = { auction: null, live: null };
 
   const Patched = function (url, protocols) {
     const isWhatnot = typeof url === 'string' &&
@@ -19,8 +34,16 @@
     let socketKind = null;
     if (isWhatnot) {
       socketKind = url.includes('/auction/') ? 'auction' : 'live';
+      const prev = lastUrlByKind[socketKind];
+      const tokensChanged = prev ? (extractTokens(prev) !== extractTokens(url)) : true;
+      lastUrlByKind[socketKind] = url;
       try {
-        window.postMessage({ type: 'WHATNOT_AUCTION_WS', url, socketKind }, '*');
+        window.postMessage({
+          type: 'WHATNOT_AUCTION_WS',
+          url,
+          socketKind,
+          tokensChanged,
+        }, '*');
       } catch (_) {}
     }
 

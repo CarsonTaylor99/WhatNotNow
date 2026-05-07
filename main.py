@@ -635,16 +635,29 @@ async def refresh_auth(request: Request):
               f"(cookie={len(cookie)}, csrf={len(csrf_token)}, session={len(session_token)})")
         return {"ok": False, "error": "missing fields"}
 
+    # Detect whether the incoming tokens differ from what we already have
+    prev = AUTH.get(socket_kind, {}) if socket_kind in ("auction", "live") else {}
+    prev_csrf    = prev.get("csrf_token", "")
+    prev_session = prev.get("session_token", "")
+    tokens_changed = (csrf_token != prev_csrf) or (session_token != prev_session)
+    cookie_changed = (cookie != AUTH.get("cookie", ""))
+
     update_auth(cookie, csrf_token, session_token, client_version, socket_kind)
     state["auth_expired"] = False
     state["error"]        = None
 
     at = int(time.time())
-    print(f"[auth] {socket_kind} refreshed at {time.strftime('%H:%M:%S')} → "
-          f"cookie={len(cookie)}ch, csrf={_trunc(csrf_token)}, "
-          f"session={_trunc(session_token)}, client_version={client_version or '(unchanged)'}")
-    await broadcast("auth_refreshed", {"message": "Tokens refreshed", "at": at})
-    return {"ok": True, "at": at}
+    flag = "NEW ✓" if tokens_changed else "same"
+    cflag = "new" if cookie_changed else "same"
+    print(f"[auth] {socket_kind} refresh @ {time.strftime('%H:%M:%S')} — "
+          f"tokens {flag}, cookie {cflag} ({len(cookie)}ch)")
+    await broadcast("auth_refreshed", {
+        "message": "Tokens refreshed",
+        "at": at,
+        "tokens_changed": tokens_changed,
+        "cookie_changed": cookie_changed,
+    })
+    return {"ok": True, "at": at, "tokens_changed": tokens_changed}
 
 
 @app.get("/auth/status")

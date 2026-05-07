@@ -52,6 +52,9 @@ async function pushJoin(socketKind, topic, payload) {
   } catch (_) { /* server may not be running */ }
 }
 
+// Most recent tokens we've sent up, per socket kind, for change detection.
+const lastPushed = { auction: null, live: null };
+
 async function pushTokens(wsUrl, socketKind) {
   let csrf, sessionToken, clientVersion;
   try {
@@ -64,17 +67,26 @@ async function pushTokens(wsUrl, socketKind) {
       socketKind = u.pathname.includes('/auction/') ? 'auction' : 'live';
     }
   } catch (e) {
+    console.warn('[wnn] pushTokens: bad URL', e.message);
     return { ok: false, error: 'Bad WS URL: ' + e.message };
   }
   if (!csrf || !sessionToken) {
+    console.warn('[wnn] pushTokens: missing csrf/session in URL');
     return { ok: false, error: 'WS URL missing csrf or session token' };
   }
+
+  const tokenKey = csrf + '|' + sessionToken;
+  const changed  = lastPushed[socketKind] !== tokenKey;
+  lastPushed[socketKind] = tokenKey;
 
   const cookies   = await chrome.cookies.getAll({ domain: 'whatnot.com' });
   const cookieStr = cookies.map(c => `${c.name}=${c.value}`).join('; ');
   if (!cookieStr) {
+    console.warn('[wnn] pushTokens: no whatnot.com cookies — not logged in?');
     return { ok: false, error: 'No whatnot.com cookies found — are you logged in?' };
   }
+
+  console.log(`[wnn] pushTokens(${socketKind}) — tokens ${changed ? 'CHANGED ✓' : 'unchanged'}, cookie ${cookieStr.length}ch`);
 
   try {
     const resp = await fetch(SCANNER_URL, {
@@ -114,38 +126,56 @@ function flashBadge(text, color) {
 // Periodically re-push the most recent URL for each socket kind so the
 // scanner stays warm even when no Whatnot tab is open. Cookies are read
 // fresh from chrome.cookies at every tick.
-async function autoRefresh() {
-  // Step 1: ask any open Whatnot tab to drop its WebSocket. The page's
-  // Phoenix client will auto-reconnect within ~1s, mint a fresh URL with
-  // new csrf+session tokens, and our WebSocket constructor patch catches
-  // them. This is what makes refresh actually autonomous — without it
-  // we'd just be re-pushing the same stale URL params with a fresh cookie.
-  let triggered = 0;
-  try {
-    const tabs = await chrome.tabs.query({ url: ['*://*.whatnot.com/*'] });
-    for (const t of tabs) {
-      try {
-        await chrome.tabs.sendMessage(t.id, { type: 'force_reconnect' });
-        triggered++;
-      } catch (_) {
-        // Tab may not have the content script loaded yet (e.g., chrome:// page)
-      }
-    }
-  } catch (_) {}
+async function autoRefresh(source = 'alarm') {
+  console.log(`[wnn auto-refresh] start (source=${source}) at ${new Date().toISOString()}`);
 
-  // Step 2: re-push the most recent captured URL for both socket kinds.
-  // Cookies are read fresh from chrome.cookies. If step 1 succeeded a
-  // moment ago, the inject.js will have just pushed the *new* URL ahead
-  // of us — this push is the cookie-only fallback for the no-tab case.
+  // Step 1: find Whatnot tabs and ask each to drop its WebSocket.
+  let tabs = [];
+  try {
+    tabs = await chrome.tabs.query({ url: ['*://*.whatnot.com/*'] });
+  } catch (e) {
+    console.warn('[wnn auto-refresh] tabs.query failed:', e.message);
+  }
+  console.log(`[wnn auto-refresh] found ${tabs.length} whatnot.com tab(s)`);
+
+  let triggered = 0;
+  for (const t of tabs) {
+    try {
+      await chrome.tabs.sendMessage(t.id, { type: 'force_reconnect' });
+      triggered++;
+      console.log(`[wnn auto-refresh] sent force_reconnect to tab ${t.id} (${t.url})`);
+    } catch (e) {
+      console.warn(`[wnn auto-refresh] tab ${t.id} sendMessage failed (no content script?):`, e.message);
+    }
+  }
+
+  // Phoenix typically reconnects within ~1s. Give it 3s to mint and capture
+  // a fresh URL before we do the cookie-fallback push.
+  if (triggered > 0) {
+    await new Promise(r => setTimeout(r, 3000));
+  }
+
+  // Step 2: cookie-fallback push (re-pushes most recent URL with fresh cookie).
   const cache = await chrome.storage.local.get(['lastWsUrl_auction', 'lastWsUrl_live']);
-  let pushed = 0;
+  let pushed = 0, changedCount = 0;
   for (const kind of ['auction', 'live']) {
     const url = cache[`lastWsUrl_${kind}`];
-    if (!url) continue;
+    if (!url) {
+      console.log(`[wnn auto-refresh] no cached URL for ${kind} — skip`);
+      continue;
+    }
+    // Snapshot tokens before push so we can tell whether the inject.js push
+    // (Step 1's reconnect path) already updated them.
+    const beforeKey = lastPushed[kind];
     const r = await pushTokens(url, kind);
-    if (r.ok) pushed++;
+    const afterKey  = lastPushed[kind];
+    if (r.ok) {
+      pushed++;
+      if (beforeKey !== afterKey) changedCount++;
+    }
   }
-  console.log(`[wnn auto-refresh] reconnects triggered: ${triggered}, cookie pushes: ${pushed}`);
+
+  console.log(`[wnn auto-refresh] DONE: tabs=${tabs.length}, force_reconnect=${triggered}, cookie_push=${pushed}, tokens_changed=${changedCount}`);
 }
 
 // Register a recurring alarm. (chrome.alarms.create overwrites if it exists,
@@ -156,12 +186,16 @@ chrome.alarms.create('autoRefresh', {
 });
 
 chrome.alarms.onAlarm.addListener((alarm) => {
-  if (alarm.name === 'autoRefresh') autoRefresh().catch(() => {});
+  console.log(`[wnn] alarm fired: ${alarm.name}`);
+  if (alarm.name === 'autoRefresh') autoRefresh('alarm').catch((e) => {
+    console.error('[wnn] autoRefresh failed:', e);
+  });
 });
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   (async () => {
     if (msg.type === 'ws_url') {
+      console.log(`[wnn] page opened ${msg.socketKind} WS — tokensChanged=${msg.tokensChanged}`);
       const result = await pushTokens(msg.url, msg.socketKind);
       sendResponse(result);
       return;
@@ -173,6 +207,20 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     }
     if (msg.type === 'category') {
       await pushCategory(msg.id, msg.label);
+      sendResponse({ ok: true });
+      return;
+    }
+    if (msg.type === 'force_refresh_now') {
+      try {
+        await autoRefresh('manual');
+        sendResponse({ ok: true });
+      } catch (e) {
+        sendResponse({ ok: false, error: String(e) });
+      }
+      return;
+    }
+    if (msg.type === 'reconnect_ack') {
+      console.log(`[wnn] page reported ${msg.closed} sockets closed`);
       sendResponse({ ok: true });
       return;
     }

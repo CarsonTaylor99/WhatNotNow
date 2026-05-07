@@ -21,6 +21,14 @@ window.addEventListener('message', (event) => {
       type: 'ws_url',
       url:  data.url,
       socketKind: data.socketKind,
+      tokensChanged: data.tokensChanged,
+    }, () => { void chrome.runtime.lastError; });
+  }
+
+  if (data.type === 'WHATNOT_RECONNECT_DONE') {
+    chrome.runtime.sendMessage({
+      type: 'reconnect_ack',
+      closed: data.closed,
     }, () => { void chrome.runtime.lastError; });
   }
 
