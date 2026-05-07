@@ -163,14 +163,31 @@
 
   .stat-box {
     background: var(--scan-col); border: 1px solid var(--border);
-    border-radius: 6px; padding: 12px;
-    display: flex; flex-direction: column; gap: 4px;
+    border-radius: 6px; padding: 10px;
+    display: flex; flex-direction: column; gap: 2px;
   }
   .stat-val {
     font-family: 'Space Mono', monospace;
-    font-size: 1.4rem; font-weight: 700; color: var(--accent);
+    font-size: 1.15rem; font-weight: 700; color: var(--accent);
   }
-  .stat-lbl { font-size: 0.65rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.08em; }
+  .stat-val.warn { color: var(--accent2); }
+  .stat-val.muted { color: var(--muted); }
+  .stat-lbl { font-size: 0.6rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.08em; }
+
+  /* auth status */
+  .auth-status {
+    display: flex; flex-direction: column; gap: 5px;
+    background: var(--scan-col); border: 1px solid var(--border);
+    border-radius: 6px; padding: 10px;
+  }
+  .auth-row {
+    display: flex; align-items: center; justify-content: space-between;
+    font-family: 'Space Mono', monospace; font-size: 0.68rem;
+  }
+  .auth-row .lbl { color: var(--muted); }
+  .auth-row .val { color: var(--text); opacity: 0.85; }
+  .auth-row .val.ok   { color: var(--accent); }
+  .auth-row .val.miss { color: var(--accent2); }
 
   /* now scanning */
   #now-scanning {
@@ -197,8 +214,10 @@
 
   /* ── giveaway feed ── */
   .feed-area {
-    display: flex; flex-direction: column;
+    display: grid;
+    grid-template-rows: auto auto 1fr auto;
     overflow: hidden;
+    min-height: 0;
   }
 
   .feed-header {
@@ -346,6 +365,69 @@
     box-shadow: 0 0 8px var(--accent2);
     animation: none;
   }
+
+  /* ── activity log ── */
+  #activity-log-panel {
+    border-top: 1px solid var(--border);
+    background: var(--surface);
+    display: flex; flex-direction: column;
+    max-height: 280px;
+    min-height: 36px;
+    transition: max-height 0.2s ease;
+  }
+  #activity-log-panel.collapsed { max-height: 36px; }
+
+  .activity-header {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 8px 28px;
+    border-bottom: 1px solid var(--border);
+    cursor: pointer;
+    user-select: none;
+    flex-shrink: 0;
+  }
+  .activity-header:hover { background: rgba(255,255,255,0.02); }
+  .activity-title {
+    font-size: 0.7rem; font-weight: 700;
+    text-transform: uppercase; letter-spacing: 0.1em;
+    color: var(--muted);
+  }
+  .activity-title .count { color: var(--accent); margin-left: 6px; }
+  .activity-toggle {
+    font-family: 'Space Mono', monospace; font-size: 0.7rem;
+    color: var(--muted);
+  }
+
+  #activity-log {
+    overflow-y: auto;
+    padding: 6px 28px 12px;
+    font-family: 'Space Mono', monospace;
+    font-size: 0.68rem;
+    line-height: 1.5;
+  }
+  .log-row {
+    display: grid;
+    grid-template-columns: 60px 90px 1fr auto;
+    gap: 10px; padding: 3px 0;
+    color: var(--text); opacity: 0.85;
+    border-bottom: 1px solid rgba(255,255,255,0.03);
+  }
+  .log-time { color: var(--muted); }
+  .log-user { color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .log-info { color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .log-outcome {
+    font-weight: 700; padding: 0 6px; border-radius: 3px;
+    font-size: 0.62rem; text-transform: uppercase;
+    letter-spacing: 0.04em;
+  }
+  .log-outcome.joined        { color: var(--accent); background: rgba(0,255,136,0.08); }
+  .log-outcome.events        { color: #000; background: var(--accent); }
+  .log-outcome.rejected      { color: var(--accent2); background: rgba(255,107,53,0.1); }
+  .log-outcome.error         { color: var(--accent2); background: rgba(255,107,53,0.1); }
+  .log-outcome.skipped       { color: var(--muted); background: rgba(255,255,255,0.04); }
+  #activity-empty {
+    color: var(--muted); font-style: italic;
+    padding: 8px 0;
+  }
 </style>
 </head>
 <body>
@@ -372,6 +454,16 @@
     </div>
 
     <div>
+      <div class="section-label">Auth</div>
+      <div class="auth-status" id="auth-status">
+        <div class="auth-row"><span class="lbl">cookie</span>      <span class="val miss" id="a-cookie">—</span></div>
+        <div class="auth-row"><span class="lbl">auction tok</span> <span class="val miss" id="a-auction">—</span></div>
+        <div class="auth-row"><span class="lbl">live tok</span>    <span class="val miss" id="a-live">—</span></div>
+        <div class="auth-row"><span class="lbl">session id</span>  <span class="val miss" id="a-sid">—</span></div>
+      </div>
+    </div>
+
+    <div>
       <div class="section-label">Stats</div>
       <div class="stats">
         <div class="stat-box">
@@ -381,6 +473,22 @@
         <div class="stat-box">
           <div class="stat-val" id="stat-found">0</div>
           <div class="stat-lbl">Found</div>
+        </div>
+        <div class="stat-box">
+          <div class="stat-val" id="stat-joined">0</div>
+          <div class="stat-lbl">Joined</div>
+        </div>
+        <div class="stat-box">
+          <div class="stat-val" id="stat-events">0</div>
+          <div class="stat-lbl">w/ Events</div>
+        </div>
+        <div class="stat-box">
+          <div class="stat-val warn" id="stat-rejected">0</div>
+          <div class="stat-lbl">Rejected</div>
+        </div>
+        <div class="stat-box">
+          <div class="stat-val warn" id="stat-errors">0</div>
+          <div class="stat-lbl">Errors</div>
         </div>
       </div>
     </div>
@@ -416,6 +524,18 @@
         <p>No giveaways detected yet.<br>Select categories and hit <strong>Start</strong>.</p>
       </div>
     </div>
+
+    <div id="activity-log-panel">
+      <div class="activity-header" id="activity-header">
+        <div class="activity-title">
+          Activity log <span class="count" id="activity-count">0</span>
+        </div>
+        <div class="activity-toggle" id="activity-toggle">▼</div>
+      </div>
+      <div id="activity-log">
+        <div id="activity-empty">No activity yet — hit Start to begin scanning.</div>
+      </div>
+    </div>
   </div>
 </main>
 
@@ -428,6 +548,8 @@
   let giveaways      = [];
   let scanning       = false;
   let streamsScanned = 0;
+  let counters       = { scanned: 0, joined: 0, with_events: 0, rejected: 0, errors: 0, skipped: 0 };
+  let activityCount  = 0;
 
   // ── Init ───────────────────────────────────────────────────────────────────
   async function init() {
@@ -440,9 +562,21 @@
     const state = await fetch('/state').then(r => r.json());
     streamsScanned = state.streams_scanned || 0;
     scanning       = state.scanning || false;
+    counters = {
+      scanned:     state.streams_scanned || 0,
+      joined:      state.joined          || 0,
+      with_events: state.with_events     || 0,
+      rejected:    state.rejected        || 0,
+      errors:      state.errors          || 0,
+      skipped:     state.skipped         || 0,
+    };
     (state.giveaways || []).forEach(g => addGiveawayCard(g));
+    (state.scan_log || []).forEach(addLogRow);
     updateStats();
     setScanning(scanning);
+
+    refreshAuthStatus();
+    setInterval(refreshAuthStatus, 5000);
 
     connectSSE();
   }
@@ -501,9 +635,28 @@
       hideAuthBanner();
       $('status-dot').className = scanning ? 'scanning' : '';
       $('status-text').textContent = '✓ Tokens refreshed';
+      refreshAuthStatus();
       setTimeout(() => {
         if (!scanning) $('status-text').textContent = 'Not scanning';
       }, 3000);
+    });
+
+    es.addEventListener('scan_result', e => {
+      const entry = JSON.parse(e.data);
+      // Update counters mirror so re-renders stay consistent
+      const o = entry.outcome;
+      if (o === 'joined_ok') {
+        counters.joined++;
+        if ((entry.giveaway_events || 0) > 0) counters.with_events++;
+      } else if (o === 'join_rejected') {
+        counters.rejected++;
+      } else if (o === 'ws_403' || o === 'ws_error' || o === 'closed_before_join') {
+        counters.errors++;
+      } else if (o === 'no_session_id') {
+        counters.skipped++;
+      }
+      addLogRow(entry);
+      updateStats();
     });
 
     es.addEventListener('status', e => {
@@ -514,6 +667,7 @@
     es.addEventListener('scanning', e => {
       const { title, username, viewers, scanned, total } = JSON.parse(e.data);
       streamsScanned = scanned;
+      counters.scanned = scanned;
       $('scan-title').textContent = title || 'Untitled';
       $('scan-meta').textContent  = `@${username}  ·  ${viewers} viewers`;
       const pct = total ? Math.round((scanned / total) * 100) : 0;
@@ -593,11 +747,16 @@
     });
     giveaways = [];
     streamsScanned = 0;
+    counters = { scanned: 0, joined: 0, with_events: 0, rejected: 0, errors: 0, skipped: 0 };
+    activityCount = 0;
     $('giveaway-feed').innerHTML = `
       <div id="empty-state">
         <div class="big-icon">🎁</div>
         <p>Scanning… giveaways will appear here.</p>
       </div>`;
+    $('activity-log').innerHTML = '<div id="activity-empty">Scanning…</div>';
+    $('activity-count').textContent = '0';
+    updateBadge();
     updateStats();
     setScanning(true);
     hideError();
@@ -620,9 +779,94 @@
   }
 
   function updateStats() {
-    $('stat-scanned').textContent = streamsScanned;
-    $('stat-found').textContent   = giveaways.length;
+    $('stat-scanned').textContent  = counters.scanned || streamsScanned;
+    $('stat-found').textContent    = giveaways.length;
+    $('stat-joined').textContent   = counters.joined;
+    $('stat-events').textContent   = counters.with_events;
+    $('stat-rejected').textContent = counters.rejected;
+    $('stat-errors').textContent   = counters.errors;
   }
+
+  // ── Activity log ─────────────────────────────────────────────────────────
+  const OUTCOME_LABEL = {
+    joined_ok:          ['joined',    'joined'],     // overridden below if events>0
+    join_rejected:      ['rejected',  'rejected'],
+    no_session_id:      ['skipped',   'skipped'],
+    ws_403:             ['error',     '403'],
+    closed_before_join: ['error',     'closed'],
+    ws_error:           ['error',     'ws err'],
+  };
+
+  function fmtTime(ts) {
+    const d = new Date(ts * 1000);
+    return d.toTimeString().slice(0, 8);
+  }
+
+  function addLogRow(entry) {
+    const log = $('activity-log');
+    $('activity-empty')?.remove();
+
+    let cssClass, label;
+    if (entry.outcome === 'joined_ok') {
+      const ge = entry.giveaway_events || 0;
+      cssClass = ge > 0 ? 'events' : 'joined';
+      label    = ge > 0 ? `${ge} GA` : 'joined';
+    } else {
+      [cssClass, label] = OUTCOME_LABEL[entry.outcome] || ['error', entry.outcome];
+    }
+
+    let info = '';
+    if (entry.outcome === 'joined_ok') {
+      info = `${entry.events_seen || 0} msgs`;
+    } else if (entry.reason) {
+      info = String(entry.reason).slice(0, 80);
+    } else if (entry.outcome === 'no_session_id') {
+      info = 'no livestreamSessionId yet — open a Whatnot tab';
+    }
+
+    const row = document.createElement('div');
+    row.className = 'log-row';
+    row.innerHTML = `
+      <span class="log-time">${fmtTime(entry.at)}</span>
+      <span class="log-user">@${escHtml(entry.username || '?')}</span>
+      <span class="log-info">${escHtml(info)}</span>
+      <span class="log-outcome ${cssClass}">${label}</span>
+    `;
+    log.insertBefore(row, log.firstChild);
+
+    // Cap at 50 visible rows
+    while (log.children.length > 50) log.removeChild(log.lastChild);
+
+    activityCount++;
+    $('activity-count').textContent = activityCount;
+  }
+
+  // ── Auth status ──────────────────────────────────────────────────────────
+  async function refreshAuthStatus() {
+    try {
+      const d = await fetch('/diagnostics').then(r => r.json());
+      const a = d.auth || {};
+      setAuthCell('a-cookie',  a.cookie_len > 0,            a.cookie_len ? `${a.cookie_len} ch` : 'missing');
+      setAuthCell('a-auction', !!(a.auction_csrf && a.auction_session), a.auction_csrf || 'missing');
+      setAuthCell('a-live',    !!(a.live_csrf && a.live_session),       a.live_csrf || 'missing');
+      setAuthCell('a-sid',     !!a.livestream_session_id,    a.livestream_session_id || 'missing');
+    } catch (_) {}
+  }
+
+  function setAuthCell(id, ok, text) {
+    const el = $(id);
+    el.textContent = text;
+    el.classList.toggle('ok',   ok);
+    el.classList.toggle('miss', !ok);
+  }
+
+  // ── Activity log collapse toggle ─────────────────────────────────────────
+  $('activity-header').addEventListener('click', () => {
+    const panel = $('activity-log-panel');
+    const t = $('activity-toggle');
+    panel.classList.toggle('collapsed');
+    t.textContent = panel.classList.contains('collapsed') ? '▲' : '▼';
+  });
 
   function updateBadge() {
     const b = $('count-badge');

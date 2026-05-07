@@ -22,6 +22,14 @@ state = {
     "selected_categories": [],
     "error":              None,
     "auth_expired":       False,
+    # Diagnostic counters — reset each scan run
+    "joined":             0,
+    "with_events":        0,
+    "rejected":           0,
+    "errors":             0,
+    "skipped":            0,
+    # Rolling tail of recent per-stream scan outcomes (max 50)
+    "scan_log":           [],
 }
 
 _sse_clients: list[asyncio.Queue] = []
@@ -61,6 +69,29 @@ async def on_giveaway(stream: dict, payload: dict):
     await broadcast("giveaway", entry)
 
 
+# ── Per-stream scan-result callback (called by scanner) ──────────────────────
+async def on_scan_result(result: dict):
+    """Update counters + rolling log + broadcast every per-stream scan outcome."""
+    outcome = result.get("outcome")
+    if outcome == "joined_ok":
+        state["joined"] += 1
+        if result.get("giveaway_events", 0) > 0:
+            state["with_events"] += 1
+    elif outcome == "join_rejected":
+        state["rejected"] += 1
+    elif outcome in ("ws_403", "ws_error", "closed_before_join"):
+        state["errors"] += 1
+    elif outcome == "no_session_id":
+        state["skipped"] += 1
+
+    entry = {"at": int(time.time()), **result}
+    state["scan_log"].append(entry)
+    if len(state["scan_log"]) > 50:
+        del state["scan_log"][:-50]
+
+    await broadcast("scan_result", entry)
+
+
 # ── Auth-expired callback (called by scanner on 403) ──────────────────────────
 async def on_auth_expired():
     if state["auth_expired"]:
@@ -82,6 +113,12 @@ async def run_scanner():
     state["giveaways"]       = []
     state["error"]           = None
     state["auth_expired"]    = False
+    state["joined"]          = 0
+    state["with_events"]     = 0
+    state["rejected"]        = 0
+    state["errors"]          = 0
+    state["skipped"]         = 0
+    state["scan_log"]        = []
 
     try:
         while not _stop_event.is_set():
@@ -119,7 +156,7 @@ async def run_scanner():
                         "total":    len(streams),
                     })
 
-                    await scan_stream(stream, on_giveaway, on_auth_expired)
+                    await scan_stream(stream, on_giveaway, on_auth_expired, on_scan_result)
 
             if not _stop_event.is_set():
                 # Brief pause between full cycles
@@ -244,6 +281,38 @@ async def auth_full():
     """Full AUTH dict — used by debug tooling to read live state.
     Localhost-only sensitive endpoint."""
     return dict(AUTH)
+
+
+@app.get("/diagnostics")
+async def diagnostics():
+    """One-stop dashboard view: auth readiness, counters, recent scan log."""
+    auction = AUTH.get("auction", {})
+    live    = AUTH.get("live", {})
+
+    def preview(s: str) -> str | None:
+        return _trunc(s) if s else None
+
+    return {
+        "auth": {
+            "cookie_len":             len(AUTH.get("cookie", "")),
+            "auction_csrf":           preview(auction.get("csrf_token", "")),
+            "auction_session":        preview(auction.get("session_token", "")),
+            "live_csrf":              preview(live.get("csrf_token", "")),
+            "live_session":           preview(live.get("session_token", "")),
+            "livestream_session_id":  preview(AUTH.get("livestream_session_id", "")),
+            "client_version":         AUTH.get("client_version", ""),
+        },
+        "counters": {
+            "scanned":     state["streams_scanned"],
+            "joined":      state["joined"],
+            "with_events": state["with_events"],
+            "rejected":    state["rejected"],
+            "errors":      state["errors"],
+            "skipped":     state["skipped"],
+            "giveaways":   len(state["giveaways"]),
+        },
+        "scan_log": state["scan_log"],
+    }
 
 
 # ── Captured phx_join store (for diagnostics) ─────────────────────────────────
