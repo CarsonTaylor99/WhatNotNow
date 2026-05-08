@@ -5,7 +5,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fetcher import get_streams
-from scanner import scan_stream, watch_giveaway
+from scanner import scan_stream, watch_giveaway, get_auth_failures
 
 DISCOVERY_CONCURRENCY = 4
 DISCOVERED_FILE       = "discovered_categories.json"
@@ -81,6 +81,11 @@ active_watchers: dict[str, asyncio.Task] = {}
 # Bounded so a long-lived process can't leak.
 payload_samples: dict[str, dict] = {}
 PAYLOAD_SAMPLES_MAX = 60
+
+# Rolling history of /auth/refresh hits so the dashboard can show whether
+# auto-refresh is actually minting fresh tokens or just recycling stale ones.
+auth_history: list[dict] = []
+AUTH_HISTORY_MAX = 200
 
 
 # ── SSE broadcast ─────────────────────────────────────────────────────────────
@@ -383,17 +388,84 @@ async def on_giveaway(stream: dict, payload: dict):
     _start_watcher(stream)
 
 
+# When N consecutive closed_before_join outcomes happen, that's a transient
+# cliff event — Whatnot just rotated session tokens and our in-flight WS
+# connections all died together. Pause briefly so the cliff burst can clear,
+# trigger a refresh request to nudge the page if it's gone silent, then
+# keep scanning.
+_consecutive_close_before_join = 0
+_CLOSE_BEFORE_JOIN_BURST_THRESHOLD = 5
+_BURST_PAUSE_SECONDS            = 8
+_pause_scanning_until: float = 0.0
+_pause_started_at:     float = 0.0  # for early-exit comparison vs fresh-push timestamp
+_last_fresh_push_at:   float = 0.0  # updated on every successful tokens_changed push
+
+# ── Offline-time tracker ──────────────────────────────────────────────────
+# We mark the scanner "offline" when a burst pause begins, and "online"
+# when the next successful join happens. Each completed offline period
+# is recorded so the dashboard can show how often / for how long the
+# scanner was unable to scan.
+_offline_started_at: float | None = None
+_offline_periods: list[dict] = []
+_OFFLINE_PERIODS_MAX = 100
+
+
+def _mark_offline(reason: str) -> None:
+    global _offline_started_at
+    if _offline_started_at is None:
+        _offline_started_at = time.time()
+        print(f"[offline] scanner went offline ({reason})")
+
+
+def _mark_online() -> None:
+    global _offline_started_at
+    if _offline_started_at is None:
+        return
+    end = time.time()
+    period = {
+        "start":    int(_offline_started_at),
+        "end":      int(end),
+        "duration": int(end - _offline_started_at),
+    }
+    _offline_periods.append(period)
+    if len(_offline_periods) > _OFFLINE_PERIODS_MAX:
+        del _offline_periods[:-_OFFLINE_PERIODS_MAX]
+    print(f"[offline] scanner back online (was offline {period['duration']}s)")
+    _offline_started_at = None
+
+
 # ── Per-stream scan-result callback (called by scanner) ──────────────────────
 async def on_scan_result(result: dict):
     """Update counters + rolling log + broadcast every per-stream scan outcome."""
+    global _consecutive_close_before_join, _pause_scanning_until, _pause_started_at
     outcome = result.get("outcome")
     if outcome == "joined_ok":
         state["joined"] += 1
         if result.get("giveaway_events", 0) > 0:
             state["with_events"] += 1
+        _consecutive_close_before_join = 0
+        _mark_online()
     elif outcome == "join_rejected":
         state["rejected"] += 1
-    elif outcome in ("ws_403", "ws_error", "closed_before_join"):
+        _consecutive_close_before_join = 0
+        _mark_online()
+    elif outcome == "closed_before_join":
+        state["errors"] += 1
+        _consecutive_close_before_join += 1
+        if _consecutive_close_before_join >= _CLOSE_BEFORE_JOIN_BURST_THRESHOLD:
+            _consecutive_close_before_join = 0
+            _pause_started_at     = time.time()
+            _pause_scanning_until = _pause_started_at + _BURST_PAUSE_SECONDS
+            _mark_offline(f"{_CLOSE_BEFORE_JOIN_BURST_THRESHOLD}+ closed_before_join in a row")
+            # Reactive refresh — kick the extension to mint fresh tokens NOW
+            # rather than waiting for the dashboard's age-based trigger or
+            # the page's organic reconnect to come around.
+            await _request_refresh("burst")
+            print(f"[main] cliff burst — pausing scanner for {_BURST_PAUSE_SECONDS}s")
+            await broadcast("status", {
+                "message": f"Auth cliff — pausing {_BURST_PAUSE_SECONDS}s, refresh requested…"
+            })
+    elif outcome in ("ws_403", "ws_error"):
         state["errors"] += 1
     elif outcome == "no_session_id":
         state["skipped"] += 1
@@ -413,11 +485,15 @@ async def on_auth_expired():
     state["auth_expired"] = True
     state["error"] = "Session tokens expired"
     await broadcast("auth_expired", {
-        "message": "Whatnot returned 403 — session tokens look stale. Open any "
-                   "Whatnot livestream once: the extension will push fresh "
-                   "tokens automatically. No restart needed."
+        "message": "Scanner can't join any streams — session tokens look stale. "
+                   "Open any Whatnot livestream once: the extension will push "
+                   "fresh tokens automatically, then click Start again."
     })
     _stop_event.set()
+    # Watchers run as independent tasks and would otherwise keep retrying
+    # with the same stale tokens, spamming closed_before_join entries until
+    # they exhaust their reconnect budget. Cancel them.
+    await _cancel_all_watchers()
 
 
 # ── Main scanner loop ─────────────────────────────────────────────────────────
@@ -430,6 +506,8 @@ async def _cancel_all_watchers():
 
 
 async def run_scanner():
+    global _consecutive_close_before_join, _pause_scanning_until
+    global _pause_started_at, _offline_started_at
     _stop_event.clear()
     await _cancel_all_watchers()
     state["streams_scanned"] = 0
@@ -442,6 +520,11 @@ async def run_scanner():
     state["errors"]          = 0
     state["skipped"]         = 0
     state["scan_log"]        = []
+    _consecutive_close_before_join = 0
+    _pause_scanning_until          = 0.0
+    _pause_started_at              = 0.0
+    _offline_started_at            = None
+    _offline_periods.clear()
 
     try:
         while not _stop_event.is_set():
@@ -476,6 +559,20 @@ async def run_scanner():
                 async def scan_one(stream: dict):
                     if _stop_event.is_set():
                         return
+                    # If a cliff burst just hit, wait — but exit early if a
+                    # fresh-token push lands during the pause. Most cliffs
+                    # resolve in 2-3s once the page reconnects; the 8s here
+                    # is just a fallback ceiling.
+                    pause_ref = _pause_started_at
+                    while _pause_scanning_until > time.time():
+                        if _stop_event.is_set():
+                            return
+                        if _last_fresh_push_at > pause_ref:
+                            # Fresh tokens arrived after this pause began —
+                            # safe to resume now instead of waiting out the
+                            # full timeout.
+                            break
+                        await asyncio.sleep(0.25)
                     async with sem:
                         if _stop_event.is_set():
                             return
@@ -605,6 +702,101 @@ async def stop_scan():
     return {"ok": True}
 
 
+# ── Extension event channel ───────────────────────────────────────────────
+# The extension subscribes on startup; events broadcast here go to all
+# connected clients. Used to ask the extension to force_reconnect — fired
+# from two places: the dashboard's age-based check (proactive) and the
+# burst detector (reactive, when scanner notices it's stuck).
+_extension_clients: list[asyncio.Queue] = []
+_last_refresh_signaled_at: float = 0.0
+_REFRESH_COOLDOWN_SEC = 15  # tightened — user wants more aggressive refresh
+
+
+async def _broadcast_to_extension(event: str, data: dict) -> int:
+    msg = f"event: {event}\ndata: {json.dumps(data)}\n\n"
+    for q in _extension_clients:
+        await q.put(msg)
+    return len(_extension_clients)
+
+
+async def _request_refresh(reason: str) -> dict:
+    """Internal: ask all connected extension clients to force_reconnect.
+    Honors the cooldown so we don't spam Whatnot's session machinery."""
+    global _last_refresh_signaled_at
+    now = time.time()
+    if (now - _last_refresh_signaled_at) < _REFRESH_COOLDOWN_SEC:
+        return {"ok": False, "skipped": "cooldown"}
+    _last_refresh_signaled_at = now
+    delivered = await _broadcast_to_extension("refresh", {"at": int(now), "reason": reason})
+    print(f"[refresh] reason={reason}, delivered to {delivered} extension client(s)")
+    return {"ok": True, "delivered": delivered}
+
+
+@app.get("/extension/keepalive")
+async def extension_keepalive(request: Request):
+    """Long-running event stream the extension subscribes to on startup.
+    Two jobs: (1) holds a fetch open so the SW isn't evicted (Brave/Chrome
+    MV3 throttle hard otherwise), (2) carries `refresh` events fired by
+    the dashboard (age-based) or the burst detector (cliff-reactive)."""
+    queue: asyncio.Queue = asyncio.Queue()
+    _extension_clients.append(queue)
+
+    async def gen():
+        try:
+            yield f": connected at {int(time.time())}\n\n"
+            while True:
+                if await request.is_disconnected():
+                    break
+                try:
+                    msg = await asyncio.wait_for(queue.get(), timeout=25)
+                    yield msg
+                except asyncio.TimeoutError:
+                    yield f": ping {int(time.time())}\n\n"
+        except asyncio.CancelledError:
+            return
+        finally:
+            try:
+                _extension_clients.remove(queue)
+            except ValueError:
+                pass
+
+    return StreamingResponse(gen(), media_type="text/event-stream")
+
+
+@app.post("/extension/request_refresh")
+async def extension_request_refresh():
+    """Dashboard pings this when token age crosses its threshold."""
+    return await _request_refresh("dashboard:age")
+
+
+@app.get("/diagnostics/offline")
+async def offline_diagnostics():
+    """How often, and for how long, the scanner has been offline this run.
+    Offline = a cliff burst happened and no successful join has landed
+    since. Periods reset when the user starts a new scan run."""
+    now = time.time()
+    completed = list(_offline_periods)
+    durations = [p["duration"] for p in completed]
+    current = None
+    if _offline_started_at is not None:
+        current = {
+            "since":            int(_offline_started_at),
+            "duration_so_far":  int(now - _offline_started_at),
+        }
+    return {
+        "now":             int(now),
+        "currently_offline": current is not None,
+        "current":         current,
+        "periods":         completed,
+        "stats": {
+            "count":        len(completed),
+            "total_offline_seconds":  sum(durations),
+            "longest_seconds":        max(durations) if durations else 0,
+            "avg_seconds":            (sum(durations) // len(durations)) if durations else 0,
+        },
+    }
+
+
 @app.get("/payload_samples")
 async def get_payload_samples():
     """First-seen payload per event_name from watcher channels.
@@ -620,6 +812,26 @@ def _trunc(s: str, n: int = 12) -> str:
     return f"{s[:n]}…{s[-6:]}" if len(s) > n + 6 else s
 
 
+def _decode_jwt_exp(token: str) -> int | None:
+    """Best-effort: pull the `exp` claim out of a JWT without verifying it.
+    Used to expose true token lifetime to the dashboard so we can tell
+    whether a 'fresh' token is actually fresh or just a different string
+    on the same expiry clock."""
+    if not token or token.count(".") != 2:
+        return None
+    import base64
+    try:
+        payload_b64 = token.split(".")[1]
+        # JWT payloads are base64url, often unpadded — pad to a multiple of 4
+        padded = payload_b64 + "=" * (-len(payload_b64) % 4)
+        raw = base64.urlsafe_b64decode(padded)
+        claims = json.loads(raw)
+        exp = claims.get("exp")
+        return int(exp) if isinstance(exp, (int, float)) else None
+    except Exception:
+        return None
+
+
 @app.post("/auth/refresh")
 async def refresh_auth(request: Request):
     """Receives fresh tokens from the Chrome extension and hot-swaps them."""
@@ -629,10 +841,26 @@ async def refresh_auth(request: Request):
     session_token  = (body.get("session_token") or "").strip()
     client_version = (body.get("client_version") or "").strip()
     socket_kind    = (body.get("socket_kind") or "auction").strip()
+    source         = (body.get("source") or "unknown").strip()
 
     if not (cookie and csrf_token and session_token):
         print(f"[auth] refresh REJECTED — missing fields "
               f"(cookie={len(cookie)}, csrf={len(csrf_token)}, session={len(session_token)})")
+        auth_history.append({
+            "at":              int(time.time()),
+            "source":          source,
+            "socket_kind":     socket_kind,
+            "tokens_changed":  False,
+            "cookie_changed":  False,
+            "ok":              False,
+            "csrf_preview":    _trunc(csrf_token) if csrf_token else "",
+            "session_preview": _trunc(session_token) if session_token else "",
+            "cookie_len":      len(cookie),
+            "session_exp":     _decode_jwt_exp(session_token),
+            "csrf_exp":        _decode_jwt_exp(csrf_token),
+        })
+        if len(auth_history) > AUTH_HISTORY_MAX:
+            del auth_history[:-AUTH_HISTORY_MAX]
         return {"ok": False, "error": "missing fields"}
 
     # Detect whether the incoming tokens differ from what we already have
@@ -649,8 +877,32 @@ async def refresh_auth(request: Request):
     at = int(time.time())
     flag = "NEW ✓" if tokens_changed else "same"
     cflag = "new" if cookie_changed else "same"
-    print(f"[auth] {socket_kind} refresh @ {time.strftime('%H:%M:%S')} — "
-          f"tokens {flag}, cookie {cflag} ({len(cookie)}ch)")
+    print(f"[auth] {socket_kind} refresh @ {time.strftime('%H:%M:%S')} "
+          f"src={source} — tokens {flag}, cookie {cflag} ({len(cookie)}ch)")
+    session_exp = _decode_jwt_exp(session_token)
+    csrf_exp    = _decode_jwt_exp(csrf_token)
+    if tokens_changed:
+        global _last_fresh_push_at
+        _last_fresh_push_at = float(at)
+    auth_history.append({
+        "at":              at,
+        "source":          source,
+        "socket_kind":     socket_kind,
+        "tokens_changed":  tokens_changed,
+        "cookie_changed":  cookie_changed,
+        "ok":              True,
+        "csrf_preview":    _trunc(csrf_token),
+        "session_preview": _trunc(session_token),
+        "cookie_len":      len(cookie),
+        "session_exp":     session_exp,
+        "csrf_exp":        csrf_exp,
+    })
+    if session_exp:
+        ttl = session_exp - at
+        print(f"[auth]   session_token exp={time.strftime('%H:%M:%S', time.localtime(session_exp))} "
+              f"(ttl {ttl}s)")
+    if len(auth_history) > AUTH_HISTORY_MAX:
+        del auth_history[:-AUTH_HISTORY_MAX]
     await broadcast("auth_refreshed", {
         "message": "Tokens refreshed",
         "at": at,
@@ -679,6 +931,131 @@ async def auth_full():
     """Full AUTH dict — used by debug tooling to read live state.
     Localhost-only sensitive endpoint."""
     return dict(AUTH)
+
+
+def _token_first_seen_at(session_preview: str, socket_kind: str, before_ts: int) -> int | None:
+    """Walk auth_history forward in time. Find when this session_preview was
+    first introduced in its most-recent contiguous run before `before_ts`.
+    That's the answer to 'how long had this token been alive when it failed?'
+
+    Filters by socket_kind — auction and live tokens are independent, so an
+    auction push doesn't reset the live token's run (and vice versa).
+
+    A 'run' = consecutive successful pushes carrying the same session_preview.
+    A push with a *different* preview ends the run; we then start tracking
+    again when that preview reappears. We return the start of the run that
+    ends at-or-before before_ts."""
+    if not session_preview:
+        return None
+    run_start: int | None = None
+    for e in auth_history:
+        if e["at"] > before_ts:
+            break
+        if not e.get("ok"):
+            continue
+        if e.get("socket_kind") != socket_kind:
+            continue
+        e_prev = e.get("session_preview")
+        if e_prev == session_preview:
+            if run_start is None:
+                run_start = e["at"]
+        elif e_prev:
+            # Different token observed — end any open run.
+            run_start = None
+    return run_start
+
+
+def _enrich_failure(f: dict) -> dict:
+    """Add token_age_at_failure and the matching push timestamp."""
+    out = dict(f)
+    first_at = _token_first_seen_at(
+        f.get("session_preview", ""),
+        f.get("socket_kind", "live"),
+        f["at"],
+    )
+    out["token_first_seen_at"] = first_at
+    out["token_age_seconds"]   = (f["at"] - first_at) if first_at else None
+    return out
+
+
+@app.get("/auth/failures")
+async def auth_failures_view():
+    """Recent 403s + transient closed_errors with token-age correlation.
+    The key signal: do failures cluster at a consistent token age? If yes,
+    Whatnot has a fixed token-lifetime cliff regardless of refresh timing."""
+    raw = get_auth_failures()
+    enriched = [_enrich_failure(f) for f in raw]
+    ages = [e["token_age_seconds"] for e in enriched if e["token_age_seconds"] is not None]
+    return {
+        "events": list(reversed(enriched)),  # newest first
+        "stats": {
+            "total":         len(enriched),
+            "ages_seconds":  ages,
+            "min_age":       min(ages) if ages else None,
+            "max_age":       max(ages) if ages else None,
+            "avg_age":       (sum(ages) // len(ages)) if ages else None,
+        },
+    }
+
+
+@app.get("/auth/history")
+async def auth_history_view():
+    """Recent /auth/refresh hits with summary stats.
+    Lets the dashboard show whether auto-refresh is actually minting new
+    tokens (source='page', tokens_changed=true) or just recycling stale ones
+    via the cookie-fallback path (source='alarm', tokens_changed=false)."""
+    now = int(time.time())
+    last_hour = [e for e in auth_history if (now - e["at"]) <= 3600]
+
+    by_source: dict[str, int] = {}
+    by_source_changed: dict[str, int] = {}
+    for e in last_hour:
+        s = e.get("source", "?")
+        by_source[s] = by_source.get(s, 0) + 1
+        if e.get("tokens_changed"):
+            by_source_changed[s] = by_source_changed.get(s, 0) + 1
+
+    last_fresh_at = next(
+        (e["at"] for e in reversed(auth_history) if e.get("tokens_changed")),
+        None,
+    )
+
+    # Latest exp values seen per socket kind — lets the dashboard show
+    # whether multiple "fresh" tokens are actually on the same expiry clock.
+    latest_exp_by_kind: dict[str, dict] = {}
+    for e in reversed(auth_history):
+        kind = e.get("socket_kind", "?")
+        if kind in latest_exp_by_kind or not e.get("ok"):
+            continue
+        if e.get("session_exp"):
+            latest_exp_by_kind[kind] = {
+                "session_exp":   e["session_exp"],
+                "csrf_exp":      e.get("csrf_exp"),
+                "captured_at":   e["at"],
+            }
+    # Correlate recent failures with auth_history so the dashboard can render
+    # "token age at failure" inline.
+    recent_failures = [_enrich_failure(f) for f in get_auth_failures()][-10:]
+    failure_ages = [e["token_age_seconds"] for e in recent_failures
+                    if e["token_age_seconds"] is not None]
+
+    return {
+        "events": list(reversed(auth_history)),  # newest first
+        "stats": {
+            "now":                          now,
+            "total_last_hour":              len(last_hour),
+            "tokens_changed_last_hour":     sum(1 for e in last_hour if e.get("tokens_changed")),
+            "by_source_last_hour":          by_source,
+            "by_source_changed_last_hour":  by_source_changed,
+            "last_event_at":                auth_history[-1]["at"] if auth_history else None,
+            "last_fresh_at":                last_fresh_at,
+            "latest_exp_by_kind":           latest_exp_by_kind,
+            "failures_recent":              list(reversed(recent_failures)),
+            "failure_age_min":              min(failure_ages) if failure_ages else None,
+            "failure_age_max":              max(failure_ages) if failure_ages else None,
+            "failure_age_avg":              (sum(failure_ages) // len(failure_ages)) if failure_ages else None,
+        },
+    }
 
 
 @app.get("/diagnostics")

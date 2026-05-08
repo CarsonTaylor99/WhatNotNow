@@ -1,11 +1,51 @@
 import asyncio
 import json
+import time
 from uuid import uuid4
 from urllib.parse import urlencode
 
 import websockets
 
 from config import WS_LIVE_URL, AUTH, SCAN_DURATION
+
+
+# Module-level ring buffer of recent auth failures (403s). main.py reads this
+# via get_auth_failures() to correlate failures with auth_history pushes.
+_auth_failures: list[dict] = []
+_AUTH_FAILURES_MAX = 100
+
+
+def _trunc(s: str, n: int = 12) -> str:
+    """Mirror of main._trunc — must produce the same preview format so
+    auth_history.session_preview can be matched against the token captured
+    here at connect-time."""
+    if not s:
+        return ""
+    return f"{s[:n]}…{s[-6:]}" if len(s) > n + 6 else s
+
+
+def get_auth_failures() -> list[dict]:
+    """Snapshot of recent 403 events. Newest last."""
+    return list(_auth_failures)
+
+
+def _record_auth_failure(
+    socket_kind: str,
+    used_session_token: str,
+    used_csrf_token: str,
+    context: str,
+    error: str,
+) -> None:
+    _auth_failures.append({
+        "at":              int(time.time()),
+        "socket_kind":     socket_kind,
+        "context":         context,
+        "session_preview": _trunc(used_session_token),
+        "csrf_preview":    _trunc(used_csrf_token),
+        "error":           str(error)[:200],
+    })
+    if len(_auth_failures) > _AUTH_FAILURES_MAX:
+        del _auth_failures[:-_AUTH_FAILURES_MAX]
 
 
 def _build_ws_url() -> str:
@@ -105,6 +145,13 @@ async def scan_stream(stream: dict, on_giveaway, on_auth_expired=None, on_result
         giveaway_events = 0
         join_error      = None
 
+        # Capture exactly which tokens this connection is using, so if a 403
+        # surfaces later we can attribute it to the right token even if AUTH
+        # has since been hot-swapped by an extension push.
+        live_at_connect = AUTH.get("live", {})
+        used_session    = live_at_connect.get("session_token", "")
+        used_csrf       = live_at_connect.get("csrf_token", "")
+
         try:
             async with websockets.connect(
                 url,
@@ -145,6 +192,13 @@ async def scan_stream(stream: dict, on_giveaway, on_auth_expired=None, on_result
                                 join_accepted = True
                             elif status == "error":
                                 join_error = payload.get("response", {})
+                                _record_auth_failure(
+                                    socket_kind="live",
+                                    used_session_token=used_session,
+                                    used_csrf_token=used_csrf,
+                                    context="scan_stream:join_rejected",
+                                    error=f"phoenix: {json.dumps(join_error)[:160]}",
+                                )
                                 print(f"[scanner] {stream_id[:8]}… join rejected: {join_error}")
                                 break
 
@@ -171,8 +225,15 @@ async def scan_stream(stream: dict, on_giveaway, on_auth_expired=None, on_result
 
         except websockets.exceptions.InvalidStatus as e:
             if "403" in str(e):
-                print("[scanner] ⚠  403 on WebSocket — session tokens may have expired. "
-                      "Have the extension re-push, or re-paste tokens.")
+                _record_auth_failure(
+                    socket_kind="live",
+                    used_session_token=used_session,
+                    used_csrf_token=used_csrf,
+                    context="scan_stream",
+                    error=str(e),
+                )
+                print(f"[scanner] ⚠  403 on WebSocket — session tokens may have expired. "
+                      f"failed_token={_trunc(used_session)} — see /auth/failures for age.")
                 outcome = "ws_403"
                 if on_auth_expired:
                     await on_auth_expired()
@@ -186,9 +247,18 @@ async def scan_stream(stream: dict, on_giveaway, on_auth_expired=None, on_result
                 extra   = {"events_seen": events_seen, "giveaway_events": giveaway_events}
                 print(f"[scanner] {stream_id[:8]}… closed cleanly (likely ended)")
             else:
-                # Whatnot routinely closes idle/transient connections; this is
-                # only an auth signal in combination with a 403 elsewhere.
-                # Don't fire auth_expired from here.
+                # When auth goes stale, Whatnot's Phoenix layer doesn't 403
+                # the WS upgrade — it accepts the connection and then closes
+                # cleanly before ack'ing phx_join. So a cluster of these IS
+                # the auth-expired signal. Record so we can correlate token
+                # age at failure.
+                _record_auth_failure(
+                    socket_kind="live",
+                    used_session_token=used_session,
+                    used_csrf_token=used_csrf,
+                    context="scan_stream:closed_before_join",
+                    error="ws closed cleanly before phoenix join ack",
+                )
                 print(f"[scanner] {stream_id[:8]}… closed before join (transient)")
                 outcome = "closed_before_join"
         except websockets.exceptions.ConnectionClosedError as e:
@@ -249,6 +319,11 @@ async def _watch_attempt(
 
     join_accepted = False
 
+    # Tokens-in-use snapshot — see comment in scan_stream for rationale.
+    live_at_connect = AUTH.get("live", {})
+    used_session    = live_at_connect.get("session_token", "")
+    used_csrf       = live_at_connect.get("csrf_token", "")
+
     try:
         async with websockets.connect(
             url,
@@ -294,6 +369,13 @@ async def _watch_attempt(
                         if payload.get("status") == "ok":
                             join_accepted = True
                         elif payload.get("status") == "error":
+                            _record_auth_failure(
+                                socket_kind="live",
+                                used_session_token=used_session,
+                                used_csrf_token=used_csrf,
+                                context="watch_attempt:join_rejected",
+                                error=f"phoenix: {json.dumps(payload.get('response'))[:160]}",
+                            )
                             return ("join_rejected", str(payload.get("response")))
 
                     if on_event_seen:
@@ -315,14 +397,40 @@ async def _watch_attempt(
                 hb_task.cancel()
 
     except websockets.exceptions.ConnectionClosedOK:
-        # Could be the stream truly ending OR Whatnot rebalancing/idle-pruning
-        # our connection. Without an explicit end event we treat as transient
-        # and let the outer loop decide whether to retry.
+        # If we never got the join ack, this is the auth-expired pattern
+        # (Phoenix closes cleanly instead of returning 403 / phx_reply error).
+        # Only record in that case — a post-join clean close is a legitimate
+        # stream-end signal, not auth.
+        if not join_accepted:
+            _record_auth_failure(
+                socket_kind="live",
+                used_session_token=used_session,
+                used_csrf_token=used_csrf,
+                context="watch_attempt:closed_before_join",
+                error="ws closed cleanly before phoenix join ack",
+            )
         return ("transient", "closed_ok")
     except websockets.exceptions.ConnectionClosedError as e:
+        # Treat closed-with-error like a failure for diagnostic purposes —
+        # if these cluster around the same token age as 403s, the server is
+        # silently killing stale-token connections instead of returning 403.
+        _record_auth_failure(
+            socket_kind="live",
+            used_session_token=used_session,
+            used_csrf_token=used_csrf,
+            context="watch_attempt:closed_error",
+            error=str(e),
+        )
         return ("transient", f"closed_error: {e}")
     except websockets.exceptions.InvalidStatus as e:
         if "403" in str(e):
+            _record_auth_failure(
+                socket_kind="live",
+                used_session_token=used_session,
+                used_csrf_token=used_csrf,
+                context="watch_attempt",
+                error=str(e),
+            )
             return ("auth_403", str(e))
         return ("transient", f"ws_error: {e}")
     except (asyncio.CancelledError, KeyboardInterrupt):

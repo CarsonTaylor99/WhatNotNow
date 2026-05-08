@@ -189,6 +189,75 @@
   .auth-row .val.ok   { color: var(--accent); }
   .auth-row .val.miss { color: var(--accent2); }
 
+  /* token-refresh history list */
+  .ah-events {
+    margin-top: 8px;
+    font-size: 11px;
+    font-family: ui-monospace, "SF Mono", Menlo, monospace;
+    line-height: 1.4;
+    max-height: 140px;
+    overflow-y: auto;
+  }
+  .ah-row {
+    display: grid;
+    grid-template-columns: 44px 44px 30px 14px 1fr;
+    gap: 6px;
+    padding: 1px 0;
+    color: var(--muted);
+    align-items: center;
+  }
+  .ah-row .ah-time { color: var(--muted); }
+  .ah-row .ah-src  { opacity: 0.85; }
+  .ah-row .ah-kind { opacity: 0.7; }
+  .ah-row .ah-flag.ok    { color: var(--accent); font-weight: 600; }
+  .ah-row .ah-flag.stale { color: #888; }
+  .ah-row .ah-flag.fail  { color: var(--accent2); font-weight: 600; }
+  .ah-row .ah-ttl  { opacity: 0.75; font-size: 10.5px; text-align: right; }
+  .ah-row .ah-ttl.dying { color: var(--accent2); }
+  #off-state.val.online  { color: var(--accent); }
+  #off-state.val.offline { color: var(--accent2); font-weight: 600; }
+  #off-current.val.live  { color: var(--accent2); font-weight: 600; }
+  .ah-empty {
+    color: var(--muted);
+    font-size: 11px;
+    font-style: italic;
+    padding: 4px 0;
+  }
+  .section-sublabel {
+    font-size: 10px;
+    color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    margin-top: 10px;
+    margin-bottom: 4px;
+    opacity: 0.7;
+  }
+  .ah-fail-row {
+    display: grid;
+    grid-template-columns: 44px 70px 60px 1fr;
+    gap: 6px;
+    padding: 1px 0;
+    color: var(--accent2);
+    font-size: 11px;
+    font-family: ui-monospace, "SF Mono", Menlo, monospace;
+    align-items: center;
+  }
+  .ah-fail-row .ah-fail-time { color: var(--muted); }
+  .ah-fail-row .ah-fail-age  { font-weight: 600; }
+  .ah-fail-row .ah-fail-ctx  { opacity: 0.75; }
+  .ah-fail-row .ah-fail-err  { opacity: 0.7; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .ah-verdict {
+    margin-top: 8px;
+    font-size: 11px;
+    line-height: 1.45;
+    padding: 6px 8px;
+    border-radius: 4px;
+    display: none;
+  }
+  .ah-verdict.good { display: block; background: rgba(0, 170, 85, 0.10); color: var(--accent); }
+  .ah-verdict.warn { display: block; background: rgba(204, 68, 0, 0.12);  color: var(--accent2); }
+  .ah-verdict.idle { display: block; background: rgba(255, 255, 255, 0.04); color: var(--muted); }
+
   /* now scanning */
   #now-scanning {
     background: var(--scan-col); border: 1px solid var(--border);
@@ -550,6 +619,35 @@
     </div>
 
     <div>
+      <div class="section-label">Token Refresh</div>
+      <div class="auth-status" id="auth-history-stats">
+        <div class="auth-row"><span class="lbl">last push</span>     <span class="val miss" id="ah-last">—</span></div>
+        <div class="auth-row"><span class="lbl">last fresh ✓</span>  <span class="val miss" id="ah-fresh">—</span></div>
+        <div class="auth-row"><span class="lbl">cycles 1h</span>     <span class="val miss" id="ah-cycles">—</span></div>
+        <div class="auth-row"><span class="lbl">fresh 1h</span>      <span class="val miss" id="ah-freshcnt">—</span></div>
+        <div class="auth-row"><span class="lbl">auct exp in</span>   <span class="val miss" id="ah-exp-auct">—</span></div>
+        <div class="auth-row"><span class="lbl">live exp in</span>   <span class="val miss" id="ah-exp-live">—</span></div>
+      </div>
+      <div id="ah-events" class="ah-events"></div>
+      <div id="ah-failures-label" class="section-sublabel" style="display:none">Recent 403s / drops</div>
+      <div id="ah-failures" class="ah-events"></div>
+      <div id="ah-verdict" class="ah-verdict"></div>
+    </div>
+
+    <div>
+      <div class="section-label">Uptime</div>
+      <div class="auth-status" id="offline-stats">
+        <div class="auth-row"><span class="lbl">status</span>     <span class="val miss" id="off-state">—</span></div>
+        <div class="auth-row"><span class="lbl">offline now</span><span class="val miss" id="off-current">—</span></div>
+        <div class="auth-row"><span class="lbl">drops</span>      <span class="val miss" id="off-count">0</span></div>
+        <div class="auth-row"><span class="lbl">total off</span>  <span class="val miss" id="off-total">0s</span></div>
+        <div class="auth-row"><span class="lbl">longest</span>    <span class="val miss" id="off-longest">0s</span></div>
+        <div class="auth-row"><span class="lbl">avg drop</span>   <span class="val miss" id="off-avg">0s</span></div>
+      </div>
+      <div id="off-recent" class="ah-events"></div>
+    </div>
+
+    <div>
       <div class="section-label">Stats</div>
       <div class="stats">
         <div class="stat-box">
@@ -661,7 +759,11 @@
     setScanning(scanning);
 
     refreshAuthStatus();
+    refreshAuthHistory();
+    refreshOfflineStats();
     setInterval(refreshAuthStatus, 5000);
+    setInterval(refreshAuthHistory, 5000);
+    setInterval(refreshOfflineStats, 2000);  // 2s — current-offline counter ticks
 
     connectSSE();
   }
@@ -1089,6 +1191,239 @@
     el.textContent = text;
     el.classList.toggle('ok',   ok);
     el.classList.toggle('miss', !ok);
+  }
+
+  // ── Token refresh history ────────────────────────────────────────────────
+  function fmtAgo(ts, now) {
+    if (!ts) return '—';
+    const s = Math.max(0, now - ts);
+    if (s < 60)    return `${s}s ago`;
+    if (s < 3600)  return `${Math.floor(s/60)}m ago`;
+    return `${Math.floor(s/3600)}h ago`;
+  }
+
+  function fmtTtl(secs) {
+    if (secs == null) return '';
+    if (secs <= 0)    return 'expired';
+    if (secs < 60)    return `${secs}s`;
+    return `${Math.floor(secs/60)}m${secs % 60 ? ' ' + (secs % 60) + 's' : ''}`;
+  }
+
+  function fmtDuration(secs) {
+    if (secs == null) return '—';
+    if (secs <= 0) return '0s';
+    if (secs < 60) return `${secs}s`;
+    if (secs < 3600) return `${Math.floor(secs/60)}m ${secs%60}s`;
+    return `${Math.floor(secs/3600)}h ${Math.floor((secs%3600)/60)}m`;
+  }
+
+  async function refreshOfflineStats() {
+    let d;
+    try {
+      d = await fetch('/diagnostics/offline').then(r => r.json());
+    } catch (_) { return; }
+
+    const stateEl = $('off-state');
+    const currEl  = $('off-current');
+    stateEl.classList.remove('online', 'offline', 'miss', 'ok');
+    currEl.classList.remove('live', 'miss', 'ok');
+
+    if (d.currently_offline && d.current) {
+      stateEl.textContent = 'OFFLINE';
+      stateEl.classList.add('offline');
+      currEl.textContent = fmtDuration(d.current.duration_so_far);
+      currEl.classList.add('live');
+    } else {
+      stateEl.textContent = 'online';
+      stateEl.classList.add('online');
+      currEl.textContent = '—';
+      currEl.classList.add('miss');
+    }
+
+    const s = d.stats || {};
+    setAuthCell('off-count',   s.count > 0,           String(s.count || 0));
+    setAuthCell('off-total',   s.total_offline_seconds > 0, fmtDuration(s.total_offline_seconds));
+    setAuthCell('off-longest', s.longest_seconds > 0, fmtDuration(s.longest_seconds));
+    setAuthCell('off-avg',     s.avg_seconds > 0,     fmtDuration(s.avg_seconds));
+
+    // Recent drops list (last 6)
+    const list = $('off-recent');
+    const periods = (d.periods || []).slice(-6).reverse();
+    const now = d.now || Math.floor(Date.now()/1000);
+    if (!periods.length) {
+      list.innerHTML = '';
+    } else {
+      list.innerHTML = periods.map(p => {
+        const ago = fmtAgo(p.end, now);
+        return `<div class="ah-row">
+          <span class="ah-time">${ago}</span>
+          <span class="ah-src">offline</span>
+          <span class="ah-kind"></span>
+          <span class="ah-flag stale">${escHtml(fmtDuration(p.duration))}</span>
+          <span class="ah-ttl"></span>
+        </div>`;
+      }).join('');
+    }
+  }
+
+  // Dashboard-driven refresh trigger — proactive. The dashboard tab is
+  // foregrounded so its setInterval fires reliably (Brave throttles SW
+  // alarms hard otherwise). Tuned for a balance: too-frequent triggers
+  // each cause their own brief cliff; too-rare leaves long offline gaps
+  // when the page goes silent.
+  const DASHBOARD_REFRESH_THRESHOLD_SEC = 150;  // 2.5 min — aggressive
+  let lastDashboardRefreshAt = 0;
+
+  async function maybeRequestRefresh(lastFreshAt, now) {
+    if (!lastFreshAt) return;
+    const age = now - lastFreshAt;
+    if (age < DASHBOARD_REFRESH_THRESHOLD_SEC) return;
+    // Client-side rate limit (server has its own 15s cooldown).
+    const since = Date.now()/1000 - lastDashboardRefreshAt;
+    if (since < 20) return;
+    lastDashboardRefreshAt = Date.now()/1000;
+    try {
+      await fetch('/extension/request_refresh', { method: 'POST' });
+    } catch (_) { /* extension/server may be down */ }
+  }
+
+  async function refreshAuthHistory() {
+    let d;
+    try {
+      d = await fetch('/auth/history').then(r => r.json());
+    } catch (_) { return; }
+    const s   = d.stats  || {};
+    const evs = d.events || [];
+    const now = s.now || Math.floor(Date.now()/1000);
+
+    maybeRequestRefresh(s.last_fresh_at, now);
+
+    setAuthCell('ah-last',     !!s.last_event_at,
+                fmtAgo(s.last_event_at, now));
+    setAuthCell('ah-fresh',    !!s.last_fresh_at,
+                fmtAgo(s.last_fresh_at, now));
+    setAuthCell('ah-cycles',   s.total_last_hour > 0,
+                String(s.total_last_hour || 0));
+    setAuthCell('ah-freshcnt', s.tokens_changed_last_hour > 0,
+                `${s.tokens_changed_last_hour || 0} / ${s.total_last_hour || 0}`);
+
+    // Current token expiry per kind — header rows
+    const expByKind = s.latest_exp_by_kind || {};
+    for (const kind of ['auction', 'live']) {
+      const cellId = kind === 'auction' ? 'ah-exp-auct' : 'ah-exp-live';
+      const info   = expByKind[kind];
+      if (!info || !info.session_exp) {
+        setAuthCell(cellId, false, '—');
+      } else {
+        const ttl = info.session_exp - now;
+        setAuthCell(cellId, ttl > 30, fmtTtl(ttl));
+      }
+    }
+
+    const list = $('ah-events');
+    if (!evs.length) {
+      list.innerHTML = '<div class="ah-empty">no refreshes yet</div>';
+    } else {
+      list.innerHTML = evs.slice(0, 12).map(e => {
+        const cls = !e.ok ? 'fail' : (e.tokens_changed ? 'ok' : 'stale');
+        const flag = !e.ok ? '✗' : (e.tokens_changed ? '✓' : '·');
+        // Token TTL at capture time (not now) — answers "did this 'fresh' token
+        // actually have a full lifetime, or just a few seconds?"
+        let ttlCell = '';
+        if (e.session_exp) {
+          const ttlAtCapture = e.session_exp - e.at;
+          const dying = ttlAtCapture < 60 ? ' dying' : '';
+          ttlCell = `<span class="ah-ttl${dying}" title="exp ${ttlAtCapture}s after capture">${fmtTtl(ttlAtCapture)}</span>`;
+        } else {
+          ttlCell = `<span class="ah-ttl"></span>`;
+        }
+        return `<div class="ah-row">
+          <span class="ah-time">${fmtAgo(e.at, now)}</span>
+          <span class="ah-src">${escHtml(e.source || '?')}</span>
+          <span class="ah-kind">${escHtml((e.socket_kind || '?').slice(0,4))}</span>
+          <span class="ah-flag ${cls}" title="${e.tokens_changed ? 'fresh tokens' : 'reused tokens'}">${flag}</span>
+          ${ttlCell}
+        </div>`;
+      }).join('');
+    }
+
+    // Failures (403s / silent drops) — render with token age at failure
+    const fails = s.failures_recent || [];
+    const failsList  = $('ah-failures');
+    const failsLabel = $('ah-failures-label');
+    if (!fails.length) {
+      failsList.innerHTML = '';
+      failsLabel.style.display = 'none';
+    } else {
+      failsLabel.style.display = '';
+      failsList.innerHTML = fails.slice(0, 8).map(f => {
+        const age = f.token_age_seconds;
+        const ageStr = age != null ? fmtTtl(age) : '?';
+        const ctx = (f.context || '').replace('watch_attempt', 'watch').replace('scan_stream', 'scan');
+        const errShort = (f.error || '').replace(/^.*?(\d{3}).*$/, '$1') || 'drop';
+        return `<div class="ah-fail-row">
+          <span class="ah-fail-time">${fmtAgo(f.at, now)}</span>
+          <span class="ah-fail-age" title="token had been alive for this long when failure hit">age ${escHtml(ageStr)}</span>
+          <span class="ah-fail-ctx">${escHtml(ctx)}</span>
+          <span class="ah-fail-err" title="${escHtml(f.error || '')}">${escHtml(errShort)}</span>
+        </div>`;
+      }).join('');
+    }
+
+    // Verdict line — interpret the last-hour stats for the user
+    const v = $('ah-verdict');
+    const total   = s.total_last_hour || 0;
+    const fresh   = s.tokens_changed_last_hour || 0;
+    const lastAge = s.last_event_at ? (now - s.last_event_at) : Infinity;
+    const failMin = s.failure_age_min;
+    const failMax = s.failure_age_max;
+    const failAvg = s.failure_age_avg;
+
+    v.classList.remove('good', 'warn', 'idle');
+
+    // If we have failure-age data, lead with it — that's the cliff-test answer.
+    if (fails.length >= 2 && failMin != null && failMax != null) {
+      const spread = failMax - failMin;
+      if (spread <= 90) {
+        v.textContent = `Cliff detected: ${fails.length} failures, all at token age ~${fmtTtl(failAvg)} ` +
+          `(spread ${spread}s). Whatnot is enforcing a fixed ~${fmtTtl(failAvg)} token lifetime.`;
+        v.classList.add('warn');
+        return;
+      } else {
+        v.textContent = `${fails.length} failures, token ages ${fmtTtl(failMin)}–${fmtTtl(failMax)} ` +
+          `(spread ${Math.floor(spread/60)}m). No fixed cliff — failures are scattered.`;
+        v.classList.add('warn');
+        return;
+      }
+    }
+
+    // Failures present but no ages — usually means tokens predate auth_history
+    // (e.g., .env-loaded tokens at scanner startup). Surface this so the
+    // "Healthy" line below doesn't lie.
+    if (fails.length >= 2 && failMin == null) {
+      v.textContent = `${fails.length} failures recorded, but token ages unknown ` +
+        `(tokens predate this session — probably loaded from .env at startup). ` +
+        `Future bursts will show real ages.`;
+      v.classList.add('warn');
+      return;
+    }
+
+    if (total === 0) {
+      v.textContent = 'No pushes in the last hour. Open a Whatnot tab so the extension has tokens to push.';
+      v.classList.add('idle');
+    } else if (lastAge > 360) {
+      v.textContent = `No push in ${Math.floor(lastAge/60)}m — alarm may be stalled. Reload the extension at chrome://extensions.`;
+      v.classList.add('warn');
+    } else if (fresh === 0) {
+      v.textContent = 'Refreshes are firing but no new tokens are being minted — the page is reusing the old WS URL. Tokens will expire.';
+      v.classList.add('warn');
+    } else if (fresh / total < 0.3) {
+      v.textContent = `Only ${fresh} of ${total} cycles minted fresh tokens — borderline. Keep a Whatnot tab open and active.`;
+      v.classList.add('warn');
+    } else {
+      v.textContent = `Healthy: ${fresh} of ${total} cycles minted fresh tokens in the last hour.`;
+      v.classList.add('good');
+    }
   }
 
   // ── Activity log collapse toggle ─────────────────────────────────────────

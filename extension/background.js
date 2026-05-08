@@ -5,12 +5,22 @@
 const SCANNER_URL    = 'http://localhost:5000/auth/refresh';
 const CAPTURE_URL    = 'http://localhost:5000/capture/join';
 const CATEGORIES_URL = 'http://localhost:5000/categories/discovered';
-// Whatnot's session-extension tokens appear to have a ~5min TTL. Refresh
-// before that hits. We can only push the most-recent captured URL params
-// — those don't update unless the page itself opens a new WebSocket
-// (e.g., user clicks into a stream). The cookie does refresh on its own
-// from chrome.cookies.getAll, so this still helps the cookie-stale case.
-const AUTO_REFRESH_MINUTES = 4;
+// No automatic force_reconnect anymore. We discovered (the hard way) that
+// every force_reconnect itself causes a cliff: closing the page's Phoenix
+// sockets makes Whatnot's server rotate the session, which invalidates
+// any in-flight tokens the scanner is using. So proactive refreshing was
+// counterproductive — every tick we tried to "save" tokens, we were
+// actually killing the ones the scanner was using.
+//
+// What we keep:
+//   - Token capture from the page's organic WS opens (inject.js → ws_url)
+//   - Manual "Force refresh now" button in the popup (user-initiated)
+//   - Service-worker keepalive (harmless, helps debugging)
+//
+// What we removed:
+//   - The auto-refresh alarm that fired every N minutes
+//   - The dashboard-driven refresh trigger
+//   - All "smart skip" logic that was only there to manage alarm cliffs
 
 // In-memory dedup so we don't POST the same (id,label) on every page nav.
 // Persisted across SW restarts via chrome.storage.local.
@@ -55,7 +65,13 @@ async function pushJoin(socketKind, topic, payload) {
 // Most recent tokens we've sent up, per socket kind, for change detection.
 const lastPushed = { auction: null, live: null };
 
-async function pushTokens(wsUrl, socketKind) {
+// `source` is one of:
+//   'page'   — the page itself opened a WS (inject.js capture path)
+//   'alarm'  — alarm-driven cookie-fallback push
+//   'manual' — user clicked "Force refresh now" or "Push manually"
+// The server uses this to surface in the dashboard so we can tell whether
+// auto-refresh is actually minting new tokens vs. recycling stale ones.
+async function pushTokens(wsUrl, socketKind, source) {
   let csrf, sessionToken, clientVersion;
   try {
     const u = new URL(wsUrl);
@@ -98,13 +114,14 @@ async function pushTokens(wsUrl, socketKind) {
         session_token:  sessionToken,
         client_version: clientVersion || '',
         socket_kind:    socketKind,
+        source:         source || 'unknown',
       }),
     });
     if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
 
     const at = Date.now();
-    // Cache per-socket URL so the auto-refresh alarm can re-push both
-    // auction and live independently with whatever was most recently seen.
+    // Cache per-socket URL so the manual-refresh path (popup button) can
+    // re-push both auction and live with whatever was most recently seen.
     const update = { lastPushedAt: at, lastWsUrl: wsUrl };
     update[`lastWsUrl_${socketKind}`] = wsUrl;
     await chrome.storage.local.set(update);
@@ -126,8 +143,8 @@ function flashBadge(text, color) {
 // Periodically re-push the most recent URL for each socket kind so the
 // scanner stays warm even when no Whatnot tab is open. Cookies are read
 // fresh from chrome.cookies at every tick.
-async function autoRefresh(source = 'alarm') {
-  console.log(`[wnn auto-refresh] start (source=${source}) at ${new Date().toISOString()}`);
+async function autoRefresh(source = 'manual') {
+  console.log(`[wnn refresh] start (source=${source}) at ${new Date().toISOString()}`);
 
   // Step 1: find Whatnot tabs and ask each to drop its WebSocket.
   let tabs = [];
@@ -167,7 +184,7 @@ async function autoRefresh(source = 'alarm') {
     // Snapshot tokens before push so we can tell whether the inject.js push
     // (Step 1's reconnect path) already updated them.
     const beforeKey = lastPushed[kind];
-    const r = await pushTokens(url, kind);
+    const r = await pushTokens(url, kind, source);
     const afterKey  = lastPushed[kind];
     if (r.ok) {
       pushed++;
@@ -178,25 +195,70 @@ async function autoRefresh(source = 'alarm') {
   console.log(`[wnn auto-refresh] DONE: tabs=${tabs.length}, force_reconnect=${triggered}, cookie_push=${pushed}, tokens_changed=${changedCount}`);
 }
 
-// Register a recurring alarm. (chrome.alarms.create overwrites if it exists,
-// so this is safe to call on every service-worker startup.)
-chrome.alarms.create('autoRefresh', {
-  delayInMinutes:  AUTO_REFRESH_MINUTES,
-  periodInMinutes: AUTO_REFRESH_MINUTES,
-});
+// Make sure no leftover auto-refresh alarm survives a code-update reload.
+// Older builds of this extension created one; clear it on startup so we
+// don't keep self-inflicting cliffs.
+chrome.alarms.clear('autoRefresh').catch(() => {});
 
-chrome.alarms.onAlarm.addListener((alarm) => {
-  console.log(`[wnn] alarm fired: ${alarm.name}`);
-  if (alarm.name === 'autoRefresh') autoRefresh('alarm').catch((e) => {
-    console.error('[wnn] autoRefresh failed:', e);
-  });
-});
+// ── Service-worker keepalive ───────────────────────────────────────────────
+// MV3 service workers get evicted when idle. Browsers (especially Brave)
+// throttle hard once that happens — alarms can drift or stop firing entirely
+// for backgrounded extensions. Holding a long-running fetch open keeps the
+// SW alive so the periodic alarm can do its job reliably.
+//
+// We connect to main.py's /extension/keepalive SSE endpoint on every SW
+// startup and just pump bytes forever. If the connection drops (server
+// restarted, network blip), we reconnect after a short delay.
+const KEEPALIVE_URL = 'http://localhost:5000/extension/keepalive';
+let keepaliveAbort = null;
+
+async function startKeepalive() {
+  if (keepaliveAbort) return;  // already running
+  keepaliveAbort = new AbortController();
+  console.log('[wnn keepalive] connecting to', KEEPALIVE_URL);
+  try {
+    const resp = await fetch(KEEPALIVE_URL, { signal: keepaliveAbort.signal });
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    const reader  = resp.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      // SSE frames are separated by blank lines.
+      let idx;
+      while ((idx = buffer.indexOf('\n\n')) !== -1) {
+        const frame = buffer.slice(0, idx);
+        buffer = buffer.slice(idx + 2);
+        let eventName = '';
+        for (const line of frame.split('\n')) {
+          if (line.startsWith('event: ')) eventName = line.slice(7).trim();
+        }
+        if (eventName === 'refresh') {
+          console.log('[wnn keepalive] refresh event received');
+          autoRefresh('server').catch(e =>
+            console.warn('[wnn keepalive] refresh failed:', e));
+        }
+      }
+    }
+  } catch (e) {
+    if (e.name !== 'AbortError') {
+      console.warn('[wnn keepalive] error:', e.message);
+    }
+  } finally {
+    keepaliveAbort = null;
+    setTimeout(() => startKeepalive(), 5000);
+  }
+}
+
+startKeepalive();
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   (async () => {
     if (msg.type === 'ws_url') {
       console.log(`[wnn] page opened ${msg.socketKind} WS — tokensChanged=${msg.tokensChanged}`);
-      const result = await pushTokens(msg.url, msg.socketKind);
+      const result = await pushTokens(msg.url, msg.socketKind, 'page');
       sendResponse(result);
       return;
     }
@@ -230,7 +292,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         sendResponse({ ok: false, error: 'No WS URL captured yet — open a Whatnot livestream first.' });
         return;
       }
-      sendResponse(await pushTokens(lastWsUrl, null));
+      sendResponse(await pushTokens(lastWsUrl, null, 'manual'));
       return;
     }
     if (msg.type === 'status') {
