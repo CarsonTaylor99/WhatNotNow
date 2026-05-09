@@ -450,7 +450,7 @@ async def watch_giveaway(
     on_event_seen=None,  # async (stream, event_name, payload) — for sample capture
     stop_event: asyncio.Event | None = None,
     max_seconds: int = 30 * 60,
-    max_reconnects: int = 4,
+    max_reconnects: int = 12,
     backoff_base: float = 2.0,
 ) -> None:
     """Hold a long-running connection to a stream that has an active giveaway.
@@ -487,9 +487,16 @@ async def watch_giveaway(
             await on_ended(stream, "idle_timeout")
             return
 
+        last_entry_before = idle_state["last_entry_at"]
         status, reason = await _watch_attempt(
             stream, on_update, on_event_seen, stop_event, deadline, idle_state,
         )
+        # If this attempt actually delivered entry events, the connection
+        # was working — reset the consecutive-failure counter so a long-
+        # lived watcher doesn't accumulate a death sentence over hours of
+        # otherwise-healthy reconnects.
+        if idle_state["last_entry_at"] > last_entry_before:
+            consec_fails = 0
 
         if status == "explicit_end":
             await on_ended(stream, reason or "ended")

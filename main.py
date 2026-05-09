@@ -1,6 +1,8 @@
 import asyncio
 import json
+import smtplib
 import time
+from email.message import EmailMessage
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -11,7 +13,10 @@ DISCOVERY_CONCURRENCY = 4
 DISCOVERED_FILE       = "discovered_categories.json"
 
 from categories import CATEGORIES
-from config import update_auth, AUTH
+from config import (
+    update_auth, AUTH,
+    SMTP_USER, SMTP_APP_PASSWORD, RECIPIENT_EMAIL, SMTP_HOST, SMTP_PORT,
+)
 
 
 def _load_discovered_categories():
@@ -263,6 +268,40 @@ def _extract_giveaway_meta(payload: dict) -> dict:
 
 
 # ── Watcher callbacks ────────────────────────────────────────────────────────
+def _clear_stale(entry: dict) -> bool:
+    """Strip stale-state keys from a giveaway entry. Returns True if anything changed."""
+    if entry.pop("stale", None):
+        entry.pop("stale_reason", None)
+        entry.pop("stale_since", None)
+        entry.pop("stale_attempts", None)
+        return True
+    return False
+
+
+_STALE_RESPAWN_MAX_ATTEMPTS = 4
+_STALE_RESPAWN_BASE_DELAY   = 45  # seconds — backs off linearly from here
+
+
+async def _delayed_respawn(stream: dict, attempt: int):
+    """Sleep, then re-spawn the watcher if the card is still stale and the
+    scanner is healthy. This auto-recovers cards whose individual WS got
+    knocked over without waiting for the discovery loop to cycle back."""
+    delay = _STALE_RESPAWN_BASE_DELAY * attempt  # 45, 90, 135, 180s
+    await asyncio.sleep(delay)
+    sid = stream["id"]
+    existing = next((g for g in state["giveaways"] if g["stream_id"] == sid), None)
+    if not existing or not existing.get("stale"):
+        return                       # card removed or already recovered
+    if not state.get("scanning"):
+        return                       # user pressed Stop
+    if _scanner_in_outage():
+        return                       # don't fight a real outage; discovery will retry
+    if sid in active_watchers and not active_watchers[sid].done():
+        return                       # somehow already running
+    print(f"[main] {sid[:8]}… respawning stale watcher (attempt {attempt})")
+    _start_watcher(stream)
+
+
 async def on_watcher_update(stream: dict, payload: dict):
     """Entry count + metadata update from a long-running watcher connection."""
     sid = stream["id"]
@@ -270,6 +309,7 @@ async def on_watcher_update(stream: dict, payload: dict):
     if not existing:
         return
     existing["entry_count"] = payload.get("entryCount", existing["entry_count"])
+    _clear_stale(existing)  # any fresh watcher data means we're connected again
     # Re-extract every update so end-time/audience/etc. stay fresh
     meta = _extract_giveaway_meta(payload)
     for k, v in meta.items():
@@ -277,11 +317,58 @@ async def on_watcher_update(stream: dict, payload: dict):
     await broadcast("update", existing)
 
 
+# Reasons in `on_watcher_ended` that mean we lost visibility, NOT that the
+# giveaway actually ended. On these we keep the card and mark it stale —
+# the giveaway is almost certainly still live on Whatnot, we just can't see
+# it. The card will auto-recover when discovery sees the same stream's
+# giveaway again or the watcher reconnects.
+_LOST_VISIBILITY_REASON_PREFIXES = (
+    "ws_403",
+    "reconnect_exhausted",
+    "join_rejected",
+    "no_session_id",
+    "stopped",
+)
+
+
+def _is_lost_visibility(reason: str) -> bool:
+    return any(reason.startswith(p) for p in _LOST_VISIBILITY_REASON_PREFIXES)
+
+
+def _scanner_in_outage() -> bool:
+    """True when failures are very likely our problem (auth gone, paused, offline)."""
+    return (
+        state.get("auth_expired", False)
+        or _offline_started_at is not None
+        or time.time() < _pause_scanning_until
+    )
+
+
 async def on_watcher_ended(stream: dict, reason: str):
-    """Giveaway ended (winner announced, stream offline, etc.) — drop the card."""
+    """Watcher exited. Decide whether the giveaway actually ended (drop the
+    card) or we just lost visibility (keep card, mark stale)."""
     sid = stream["id"]
-    state["giveaways"] = [g for g in state["giveaways"] if g["stream_id"] != sid]
     active_watchers.pop(sid, None)
+
+    if _is_lost_visibility(reason) or _scanner_in_outage():
+        existing = next((g for g in state["giveaways"] if g["stream_id"] == sid), None)
+        if existing:
+            attempts = existing.get("stale_attempts", 0) + 1
+            existing["stale"]          = True
+            existing["stale_reason"]   = reason
+            existing["stale_since"]    = int(time.time())
+            existing["stale_attempts"] = attempts
+            print(f"[watcher] {sid[:8]}… stale (attempt {attempts}, {reason})")
+            await broadcast("update", existing)
+            # Schedule a background respawn so the card self-heals without
+            # waiting for the discovery loop. Capped to avoid thrashing.
+            if attempts <= _STALE_RESPAWN_MAX_ATTEMPTS:
+                asyncio.create_task(_delayed_respawn(stream, attempts))
+        return
+
+    # True end signal (explicit end event, idle_timeout on a connected
+    # socket, max_watch_reached) — drop the card.
+    state["giveaways"] = [g for g in state["giveaways"] if g["stream_id"] != sid]
     print(f"[watcher] {sid[:8]}… ended ({reason})")
     await broadcast("giveaway_ended", {"stream_id": sid, "reason": reason})
 
@@ -367,7 +454,13 @@ async def on_giveaway(stream: dict, payload: dict):
     existing = next((g for g in state["giveaways"] if g["stream_id"] == stream_id), None)
     if existing:
         existing["entry_count"] = payload.get("entryCount", existing["entry_count"])
+        was_stale = _clear_stale(existing)
+        if was_stale:
+            print(f"[main] {stream_id[:8]}… reconnected (was stale) — respawning watcher")
         await broadcast("update", existing)
+        # If watcher died (e.g., reconnect_exhausted during a cliff), bring it back
+        if stream_id not in active_watchers or active_watchers[stream_id].done():
+            _start_watcher(stream)
         return
 
     entry = {
@@ -604,6 +697,72 @@ async def run_scanner():
 
 
 # ── Routes ────────────────────────────────────────────────────────────────────
+def _build_giveaway_email(entry: dict) -> EmailMessage:
+    """Compose the email body for a single giveaway. Plain text is enough —
+    iOS Mail will auto-link the URL so it's tappable."""
+    msg = EmailMessage()
+    msg["Subject"] = f"🎁 Whatnot giveaway from @{entry.get('username', '?')}"
+    msg["From"]    = SMTP_USER
+    msg["To"]      = RECIPIENT_EMAIL
+
+    lines = [
+        f"@{entry.get('username','?')} is running a giveaway right now.",
+        "",
+        f"Title:   {entry.get('title','—')}",
+        f"Entries: {entry.get('entry_count', 0)}",
+    ]
+    if entry.get("category"):
+        lines.append(f"Category: {entry['category']}")
+    if entry.get("product_name"):
+        lines.append(f"Product:  {entry['product_name']}")
+    if entry.get("audience"):
+        lines.append(f"Audience: {entry['audience']}")
+    if isinstance(entry.get("ends_at"), int):
+        remaining = entry["ends_at"] - int(time.time())
+        if remaining > 0:
+            lines.append(f"Ends in:  {remaining // 60}m {remaining % 60}s")
+    lines += ["", f"Join: {entry.get('url', '')}"]
+    msg.set_content("\n".join(lines))
+    return msg
+
+
+def _send_email_blocking(entry: dict) -> None:
+    """Sync SMTP call — run inside asyncio.to_thread so it doesn't block the loop."""
+    if not (SMTP_USER and SMTP_APP_PASSWORD and RECIPIENT_EMAIL):
+        raise RuntimeError(
+            "Email not configured — set SMTP_USER, SMTP_APP_PASSWORD, "
+            "and RECIPIENT_EMAIL in .env (see env.example for Gmail steps)."
+        )
+    msg = _build_giveaway_email(entry)
+    with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=15) as smtp:
+        smtp.starttls()
+        smtp.login(SMTP_USER, SMTP_APP_PASSWORD)
+        smtp.send_message(msg)
+
+
+@app.post("/email/{stream_id}")
+async def email_giveaway(stream_id: str):
+    """Send a single giveaway's join link to RECIPIENT_EMAIL via SMTP."""
+    if not _UUID_RE.match(stream_id):
+        return {"ok": False, "error": "invalid stream_id"}
+    entry = next((g for g in state["giveaways"] if g["stream_id"] == stream_id), None)
+    if not entry:
+        return {"ok": False, "error": "giveaway not in state (may have ended)"}
+    try:
+        await asyncio.to_thread(_send_email_blocking, entry)
+    except Exception as e:
+        print(f"[email] failed for {stream_id[:8]}…: {e}")
+        return {"ok": False, "error": str(e)}
+    print(f"[email] sent giveaway @{entry.get('username','?')} → {RECIPIENT_EMAIL}")
+    return {"ok": True}
+
+
+@app.get("/email/config")
+async def email_config():
+    """Tells the frontend whether to render the email button."""
+    return {"enabled": bool(SMTP_USER and SMTP_APP_PASSWORD and RECIPIENT_EMAIL)}
+
+
 @app.get("/")
 async def index():
     with open("static/index.html", encoding="utf-8") as f:

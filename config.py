@@ -45,6 +45,14 @@ def update_auth(
 
 SCAN_DURATION  = int(os.getenv("SCAN_DURATION", "15"))
 
+# Email — for the "send to phone" button on each giveaway card. Gmail SMTP
+# with an app password is the simplest setup; see env.example for the link.
+SMTP_USER         = os.getenv("SMTP_USER", "")
+SMTP_APP_PASSWORD = os.getenv("SMTP_APP_PASSWORD", "")
+RECIPIENT_EMAIL   = os.getenv("RECIPIENT_EMAIL", "")
+SMTP_HOST         = os.getenv("SMTP_HOST", "smtp.gmail.com")
+SMTP_PORT         = int(os.getenv("SMTP_PORT", "587"))
+
 GRAPHQL_URL    = "https://www.whatnot.com/services/graphql/"
 WS_AUCTION_URL = "wss://www.whatnot.com/services/auction/socket/websocket"
 WS_LIVE_URL    = "wss://www.whatnot.com/services/live/socket/websocket"

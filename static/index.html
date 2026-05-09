@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Whatnot Giveaway Scanner</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
-<link href="https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=Syne:wght@400;600;800&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=Inter:wght@400;600;800&display=swap" rel="stylesheet">
 <style>
   :root {
     --bg:        #0a0a0f;
@@ -25,7 +25,7 @@
   body {
     background: var(--bg);
     color: var(--text);
-    font-family: 'Syne', sans-serif;
+    font-family: 'Inter', sans-serif;
     min-height: 100vh;
     display: grid;
     grid-template-rows: auto 1fr;
@@ -88,7 +88,7 @@
   .controls { display: flex; gap: 10px; align-items: center; }
 
   button {
-    font-family: 'Syne', sans-serif;
+    font-family: 'Inter', sans-serif;
     font-size: 0.8rem; font-weight: 600;
     padding: 8px 20px; border-radius: 6px;
     border: 1px solid transparent; cursor: pointer;
@@ -283,16 +283,39 @@
 
   /* ── giveaway feed ── */
   .feed-area {
-    display: grid;
-    grid-template-rows: auto auto 1fr auto;
+    display: flex;
+    flex-direction: column;
     overflow: hidden;
     min-height: 0;
   }
 
+  /* Wraps the feed-header + scrollable card list. Collapsible like
+     the activity log so they can share vertical space. */
+  #giveaway-panel {
+    display: flex; flex-direction: column;
+    flex: 1 1 60%;
+    min-height: 36px;
+    overflow: hidden;
+    border-bottom: 1px solid var(--border);
+  }
+  #giveaway-panel.collapsed { flex: 0 0 auto; }
+  #giveaway-panel.collapsed #giveaway-feed { display: none; }
+  #giveaway-panel.collapsed .feed-header { border-bottom: none; }
+
   .feed-header {
-    padding: 20px 28px 16px;
+    padding: 18px 28px 16px;
     border-bottom: 1px solid var(--border);
     display: flex; align-items: center; justify-content: space-between;
+    cursor: pointer; user-select: none;
+    flex-shrink: 0;
+    transition: background 0.15s;
+  }
+  .feed-header:hover { background: rgba(255,255,255,0.02); }
+
+  .feed-header-right { display: flex; align-items: center; gap: 12px; }
+  .panel-toggle {
+    font-family: 'Space Mono', monospace; font-size: 0.7rem;
+    color: var(--muted);
   }
 
   .feed-title { font-size: 1rem; font-weight: 800; }
@@ -306,7 +329,9 @@
   .badge.has-items { border-color: var(--accent); color: var(--accent); }
 
   #giveaway-feed {
-    flex: 1; overflow-y: auto;
+    flex: 1 1 auto;
+    overflow-y: auto;
+    min-height: 0;
     padding: 20px 28px;
     display: flex; flex-direction: column; gap: 14px;
   }
@@ -346,7 +371,28 @@
     overflow: hidden;
   }
 
-  .giveaway-card:hover { border-color: var(--accent); box-shadow: var(--glow); }
+  .giveaway-card:hover {
+    border-color: var(--accent);
+    box-shadow: 0 0 28px rgba(0,255,136,0.22);
+    background: #16161f;
+  }
+
+  /* Stale = watcher disconnected during an outage, but the giveaway is
+     almost certainly still live. Indicate with a muted left border + the
+     "● disconnected" pill — but DO NOT dim the card. Full brightness so
+     the info stays as readable as a live card. */
+  .giveaway-card.stale {
+    border-left-color: var(--muted);
+  }
+  .stale-pill {
+    font-family: 'Space Mono', monospace;
+    font-size: 0.65rem;
+    padding: 2px 8px; border-radius: 4px;
+    color: var(--muted);
+    border: 1px dashed var(--muted);
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+  }
 
   .card-thumb {
     width: 56px; height: 56px; border-radius: 6px;
@@ -362,13 +408,20 @@
 
   .card-info { overflow: hidden; }
   .card-title {
-    font-weight: 700; font-size: 0.88rem;
+    font-weight: 700; font-size: 0.98rem;
     white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
-    margin-bottom: 3px;
+    margin-bottom: 4px;
   }
   .card-seller {
     font-family: 'Space Mono', monospace;
-    font-size: 0.68rem; color: var(--muted); margin-bottom: 6px;
+    font-size: 1rem; font-weight: 700;
+    color: var(--text);
+    letter-spacing: -0.01em;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    max-width: 180px;
+    text-align: right;
   }
   .card-meta { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
   .entry-count {
@@ -378,8 +431,8 @@
     padding: 2px 8px; border-radius: 4px;
   }
   .cat-pill {
-    font-size: 0.65rem; color: var(--muted);
-    padding: 2px 8px; border: 1px solid var(--border);
+    font-size: 0.72rem; color: #b8b8d8;
+    padding: 2px 8px; border: 1px solid #2a2a3a;
     border-radius: 4px;
   }
   .timer-pill {
@@ -396,10 +449,10 @@
   }
   .elapsed-pill {
     font-family: 'Space Mono', monospace;
-    font-size: 0.7rem;
+    font-size: 0.74rem;
     padding: 2px 8px; border-radius: 4px;
-    color: var(--muted);
-    border: 1px solid var(--border);
+    color: #b8b8d8;
+    border: 1px solid #2a2a3a;
   }
   .channel-diag {
     font-family: 'Space Mono', monospace;
@@ -419,7 +472,7 @@
     text-transform: uppercase; letter-spacing: 0.04em;
   }
   .product-line {
-    font-size: 0.74rem; color: var(--text); opacity: 0.85;
+    font-size: 0.82rem; color: var(--text); opacity: 0.9;
     margin-top: 6px;
     overflow: hidden; text-overflow: ellipsis;
     display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
@@ -461,9 +514,9 @@
   .card-debug summary::before { content: '▸ '; }
   .card-debug[open] summary::before { content: '▾ '; }
 
-  .card-actions { display: flex; flex-direction: column; gap: 6px; }
+  .card-actions { display: flex; flex-direction: row; gap: 12px; align-items: center; }
   .join-btn {
-    font-family: 'Syne', sans-serif;
+    font-family: 'Inter', sans-serif;
     font-size: 0.72rem; font-weight: 700;
     padding: 8px 16px; border-radius: 5px;
     background: var(--accent); color: #000;
@@ -474,6 +527,28 @@
     transition: all 0.15s;
   }
   .join-btn:hover { box-shadow: var(--glow); filter: brightness(1.1); }
+
+  /* Email button — sends the giveaway link to RECIPIENT_EMAIL so you can
+     tap it on your phone. Only rendered when SMTP is configured server-side. */
+  .email-btn {
+    font-family: 'Inter', sans-serif;
+    font-size: 0.95rem;
+    width: 36px; height: 36px;
+    padding: 0;
+    border-radius: 5px;
+    background: transparent;
+    color: var(--text);
+    border: 1px solid #2a2a3a;
+    cursor: pointer;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    transition: all 0.15s;
+  }
+  .email-btn:hover { border-color: var(--text); background: rgba(255,255,255,0.05); }
+  .email-btn:disabled { cursor: default; filter: none; }
+  .email-btn.sent  { border-color: var(--accent);  color: var(--accent); }
+  .email-btn.error { border-color: var(--accent2); color: var(--accent2); }
 
   /* scrollbar */
   ::-webkit-scrollbar { width: 4px; }
@@ -500,7 +575,7 @@
   }
   #auth-banner.visible { display: block; }
   #auth-banner .auth-title {
-    font-family: 'Syne', sans-serif; font-weight: 800;
+    font-family: 'Inter', sans-serif; font-weight: 800;
     font-size: 0.85rem; color: var(--accent2);
     text-transform: uppercase; letter-spacing: 0.06em;
     margin-bottom: 6px;
@@ -523,14 +598,14 @@
 
   /* ── activity log ── */
   #activity-log-panel {
-    border-top: 1px solid var(--border);
     background: var(--surface);
     display: flex; flex-direction: column;
-    max-height: 280px;
+    flex: 1 1 40%;
     min-height: 36px;
-    transition: max-height 0.2s ease;
+    overflow: hidden;
   }
-  #activity-log-panel.collapsed { max-height: 36px; }
+  #activity-log-panel.collapsed { flex: 0 0 auto; }
+  #activity-log-panel.collapsed #activity-log { display: none; }
 
   .activity-header {
     display: flex; align-items: center; justify-content: space-between;
@@ -553,7 +628,9 @@
   }
 
   #activity-log {
+    flex: 1 1 auto;
     overflow-y: auto;
+    min-height: 0;
     padding: 6px 28px 12px;
     font-family: 'Space Mono', monospace;
     font-size: 0.68rem;
@@ -688,10 +765,6 @@
   </aside>
 
   <div class="feed-area">
-    <div class="feed-header">
-      <div class="feed-title">Live Giveaways</div>
-      <div class="badge" id="count-badge">0 detected</div>
-    </div>
     <div id="auth-banner">
       <div class="auth-title">⚠ Session tokens stale</div>
       <div class="auth-body" id="auth-body">
@@ -701,10 +774,20 @@
       </div>
     </div>
     <div id="error-banner"></div>
-    <div id="giveaway-feed">
-      <div id="empty-state">
-        <div class="big-icon">🎁</div>
-        <p>No giveaways detected yet.<br>Select categories and hit <strong>Start</strong>.</p>
+
+    <div id="giveaway-panel">
+      <div class="feed-header" id="giveaway-header">
+        <div class="feed-title">Live Giveaways</div>
+        <div class="feed-header-right">
+          <div class="badge" id="count-badge">0 detected</div>
+          <div class="panel-toggle" id="giveaway-toggle">▼</div>
+        </div>
+      </div>
+      <div id="giveaway-feed">
+        <div id="empty-state">
+          <div class="big-icon">🎁</div>
+          <p>No giveaways detected yet.<br>Select categories and hit <strong>Start</strong>.</p>
+        </div>
       </div>
     </div>
 
@@ -733,6 +816,7 @@
   let streamsScanned = 0;
   let counters       = { scanned: 0, joined: 0, with_events: 0, rejected: 0, errors: 0, skipped: 0 };
   let activityCount  = 0;
+  let emailEnabled   = false;  // set from /email/config at init
 
   // ── Init ───────────────────────────────────────────────────────────────────
   async function init() {
@@ -764,6 +848,12 @@
     setInterval(refreshAuthStatus, 5000);
     setInterval(refreshAuthHistory, 5000);
     setInterval(refreshOfflineStats, 2000);  // 2s — current-offline counter ticks
+
+    // Email button only renders if SMTP is configured server-side
+    try {
+      const cfg = await fetch('/email/config').then(r => r.json());
+      emailEnabled = !!cfg.enabled;
+    } catch (_) { emailEnabled = false; }
 
     connectSSE();
   }
@@ -1013,15 +1103,18 @@
     const debug = (unknown || channel)
       ? `<details class="card-debug"><summary>debug</summary>${unknown}${channel}</details>`
       : '';
+    const stalePill = entry.stale
+      ? `<span class="stale-pill" title="Live updates paused — auto-retrying in background. (reason: ${escHtml(entry.stale_reason || 'unknown')})">● paused</span>`
+      : '';
     return `
       <div class="card-title">${escHtml(entry.title)}</div>
-      <div class="card-seller">@${escHtml(entry.username)}</div>
       <div class="card-meta">
         <span class="entry-count">${entry.entry_count} entries</span>
         ${entry.category ? `<span class="cat-pill">${escHtml(entry.category)}</span>` : ''}
         ${elapsed}
         ${timer}
         ${audience}
+        ${stalePill}
       </div>
       ${product}
       ${debug}
@@ -1033,7 +1126,7 @@
     $('empty-state')?.remove();
 
     const card = document.createElement('div');
-    card.className = 'giveaway-card';
+    card.className = 'giveaway-card' + (entry.stale ? ' stale' : '');
     card.dataset.id = entry.stream_id;
 
     const thumbHtml = entry.thumbnail
@@ -1046,6 +1139,10 @@
         ${renderCardBody(entry)}
       </div>
       <div class="card-actions">
+        <div class="card-seller">@${escHtml(entry.username)}</div>
+        ${emailEnabled
+          ? `<button class="email-btn" data-stream-id="${entry.stream_id}" title="Email this giveaway link to your phone">✉</button>`
+          : ''}
         <a class="join-btn" href="${entry.url}" target="_blank" rel="noopener">Join ↗</a>
       </div>
     `;
@@ -1058,6 +1155,7 @@
   function refreshCardBody(entry) {
     const card = document.querySelector(`.giveaway-card[data-id="${entry.stream_id}"]`);
     if (!card) return;
+    card.classList.toggle('stale', !!entry.stale);
     const info = card.querySelector('.card-info');
     if (info) info.innerHTML = renderCardBody(entry);
     if (typeof entry.ends_at === 'number') {
@@ -1426,10 +1524,63 @@
     }
   }
 
-  // ── Activity log collapse toggle ─────────────────────────────────────────
+  // ── Email button (event delegation — survives card replacement) ─────────
+  $('giveaway-feed').addEventListener('click', async e => {
+    const btn = e.target.closest('.email-btn');
+    if (!btn || btn.disabled) return;
+    const sid = btn.dataset.streamId;
+    if (!sid) return;
+    btn.disabled = true;
+    btn.classList.remove('sent', 'error');
+    btn.textContent = '…';
+    try {
+      const res = await fetch(`/email/${sid}`, { method: 'POST' });
+      const data = await res.json();
+      if (data.ok) {
+        btn.classList.add('sent');
+        btn.textContent = '✓';
+        btn.title = 'Sent';
+        setTimeout(() => {
+          btn.classList.remove('sent');
+          btn.textContent = '✉';
+          btn.title = 'Email this giveaway link to your phone';
+          btn.disabled = false;
+        }, 3500);
+      } else {
+        btn.classList.add('error');
+        btn.textContent = '✗';
+        btn.title = data.error || 'Send failed';
+        setTimeout(() => {
+          btn.classList.remove('error');
+          btn.textContent = '✉';
+          btn.title = 'Email this giveaway link to your phone';
+          btn.disabled = false;
+        }, 5000);
+      }
+    } catch (err) {
+      btn.classList.add('error');
+      btn.textContent = '✗';
+      btn.title = String(err);
+      setTimeout(() => {
+        btn.classList.remove('error');
+        btn.textContent = '✉';
+        btn.disabled = false;
+      }, 5000);
+    }
+  });
+
+  // ── Panel collapse toggles ──────────────────────────────────────────────
   $('activity-header').addEventListener('click', () => {
     const panel = $('activity-log-panel');
     const t = $('activity-toggle');
+    panel.classList.toggle('collapsed');
+    t.textContent = panel.classList.contains('collapsed') ? '▲' : '▼';
+  });
+
+  $('giveaway-header').addEventListener('click', e => {
+    if (e.target.closest('a, button')) return;
+    const panel = $('giveaway-panel');
+    const t = $('giveaway-toggle');
     panel.classList.toggle('collapsed');
     t.textContent = panel.classList.contains('collapsed') ? '▲' : '▼';
   });
