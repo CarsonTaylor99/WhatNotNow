@@ -589,6 +589,48 @@
     border-radius: 3px; font-size: 0.7rem;
   }
 
+  /* quick-start guide — shown until dismissed, hidden while scanning */
+  #quickstart {
+    position: relative;
+    background: rgba(0,255,136,0.06);
+    border: 1px solid var(--border); border-left: 4px solid var(--accent);
+    border-radius: 6px; margin: 12px 28px 0;
+    padding: 14px 18px 16px;
+  }
+  #quickstart.hidden { display: none; }
+  #quickstart .qs-title {
+    font-family: 'Inter', sans-serif; font-weight: 800;
+    font-size: 0.85rem; color: var(--accent);
+    text-transform: uppercase; letter-spacing: 0.06em;
+    margin-bottom: 12px;
+  }
+  #quickstart ol {
+    list-style: none; counter-reset: qs;
+    display: flex; flex-direction: column; gap: 9px;
+  }
+  #quickstart li {
+    counter-increment: qs;
+    font-family: 'Space Mono', monospace; font-size: 0.74rem;
+    line-height: 1.55; color: var(--text); opacity: 0.9;
+    padding-left: 28px; position: relative;
+  }
+  #quickstart li::before {
+    content: counter(qs);
+    position: absolute; left: 0; top: 0;
+    width: 18px; height: 18px; border-radius: 50%;
+    background: var(--accent); color: #000;
+    font-family: 'Inter', sans-serif; font-weight: 800; font-size: 0.68rem;
+    display: flex; align-items: center; justify-content: center;
+  }
+  #quickstart li strong { color: var(--accent); font-weight: 700; }
+  #quickstart .qs-dismiss {
+    position: absolute; top: 8px; right: 10px;
+    background: none; border: none; color: var(--muted);
+    font-size: 1.1rem; line-height: 1; cursor: pointer;
+    padding: 4px 8px; text-transform: none; letter-spacing: 0;
+  }
+  #quickstart .qs-dismiss:hover { color: var(--text); }
+
   /* status-dot auth state */
   #status-dot.auth-fail {
     background: var(--accent2);
@@ -765,6 +807,15 @@
   </aside>
 
   <div class="feed-area">
+    <div id="quickstart">
+      <button class="qs-dismiss" id="qs-dismiss" title="Hide this guide">×</button>
+      <div class="qs-title">Quick start</div>
+      <ol>
+        <li>Open <strong>whatnot.com</strong> in Chrome (any livestream works) and <strong>leave that tab open in the background</strong> — the extension keeps feeding fresh login tokens to this scanner.</li>
+        <li>Pick the categories you want to watch in the sidebar on the left.</li>
+        <li><strong>Then</strong> hit <strong>Start</strong>. Detected giveaways show up below.</li>
+      </ol>
+    </div>
     <div id="auth-banner">
       <div class="auth-title">⚠ Session tokens stale</div>
       <div class="auth-body" id="auth-body">
@@ -1200,6 +1251,16 @@
     $('now-scanning').classList.remove('visible');
   });
 
+  // ── Quick-start guide ─────────────────────────────────────────────────────
+  function updateQuickstart() {
+    const dismissed = localStorage.getItem('wnn_guide_dismissed') === '1';
+    $('quickstart').classList.toggle('hidden', dismissed || scanning);
+  }
+  $('qs-dismiss').addEventListener('click', () => {
+    localStorage.setItem('wnn_guide_dismissed', '1');
+    updateQuickstart();
+  });
+
   // ── Helpers ───────────────────────────────────────────────────────────────
   function setScanning(on) {
     scanning = on;
@@ -1207,6 +1268,7 @@
     if (!on) $('status-text').textContent = 'Not scanning';
     $('btn-start').disabled = on;
     $('btn-stop').disabled  = !on;
+    updateQuickstart();
   }
 
   function updateStats() {

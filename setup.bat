@@ -15,25 +15,34 @@ echo.
 echo === Whatnot Scanner — Setup ===
 echo.
 
-REM ── Check Python is on PATH ─────────────────────────────────────────────────
-where python >nul 2>nul
-if errorlevel 1 (
+REM ── Pick a Python ───────────────────────────────────────────────────────────
+REM install.bat passes the interpreter it resolved (or auto-installed) as %1.
+REM Run standalone? Fall back to `python` then the `py` launcher on PATH.
+set "PYEXE=%~1"
+if not defined PYEXE (
+    where python >nul 2>nul && set "PYEXE=python"
+)
+if not defined PYEXE (
+    where py >nul 2>nul && set "PYEXE=py"
+)
+if not defined PYEXE (
     echo ERROR: Python not found on PATH.
     echo Install Python 3.10+ from https://www.python.org/downloads/
-    echo Make sure to check "Add Python to PATH" during install.
+    echo Make sure to check "Add Python to PATH" during install,
+    echo or just run install.bat which can install it for you.
     echo.
     pause
     exit /b 1
 )
 
 REM Show which Python we'll use
-for /f "tokens=*" %%v in ('python --version') do echo Using %%v
+for /f "tokens=*" %%v in ('"%PYEXE%" --version 2^>^&1') do echo Using %%v
 
 REM ── Create virtualenv if missing ────────────────────────────────────────────
 if not exist ".venv\Scripts\python.exe" (
     echo.
     echo Creating virtual environment in .venv\ ...
-    python -m venv .venv
+    "%PYEXE%" -m venv .venv
     if errorlevel 1 (
         echo.
         echo Failed to create virtualenv. See errors above.
@@ -60,8 +69,10 @@ echo.
 echo === Setup complete ===
 echo.
 echo Next steps:
-echo   1. Make sure .env is in this folder (copy from your old PC).
-echo   2. Load the extension\ folder as an unpacked extension in Chrome.
-echo   3. Run start.bat to launch the scanner.
+echo   1. Make sure .env is in this folder ^(optional — the extension feeds
+echo      tokens to the server once you open a Whatnot stream^).
+echo   2. Load the extension\ folder as an unpacked extension in your browser
+echo      ^(Chrome / Edge / Brave: Extensions page -^> Developer mode -^> Load unpacked^).
+echo   3. Run start.bat to launch the scanner, then open http://localhost:5000
 echo.
 pause
